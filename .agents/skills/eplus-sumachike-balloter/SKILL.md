@@ -87,6 +87,16 @@ The first time you sign into `member.eplus.jp` on a newly booted iOS Simulator, 
    uv run ios_balloter.py --pairs <SERIAL_1>:福岡公演 <SERIAL_2>:愛知公演
    ```
 
+## MCP Server Mode (`mcp_server.py`)
+
+When running inside an MCP-enabled agent alongside Gmail / Google Sheets / Discord MCPs, start [mcp_server.py](../../../mcp_server.py) (`uv run mcp_server.py`) to use structured tools instead of CLI polling:
+
+1. Call `sim_status()` (and `sim_boot()` if needed) to verify the iPhone Simulator and Appium are ready.
+2. Call `eplus_submit_ballot(entry_url, serial_code, session_name, seat_keyword, goods_keyword, quantity, dry_run=True)` to verify the final confirmation screen via `sim_screenshot()`, then re-call with `dry_run=False`.
+3. If `eplus_submit_ballot()` returns `status == "OTP_REQUIRED"`, fetch the 6-digit code from email (e.g., via Gmail MCP or ask the user), call `eplus_submit_otp(otp_code="123456")`, and re-call `eplus_submit_ballot()`.
+4. Call `eplus_check_history()` on results day to inspect `申込み履歴` (`https://eplus.jp/jyoukyou/`).
+5. Always supply credentials via server env vars (`EPLUS_USERNAME` + `EPLUS_PASSWORD` or `EPLUS_KEYCHAIN_SERVICE`) so passwords never enter LLM tool arguments.
+
 ## Validation Steps
 
 After running `ios_balloter.py`:

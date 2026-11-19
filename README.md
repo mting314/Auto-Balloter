@@ -69,8 +69,28 @@ Because `config.toml` is tracked in git, either keep placeholder credentials in 
 git update-index --skip-worktree config.toml
 ```
 
+### MCP Server (`mcp_server.py`)
+To expose the iOS Simulator Sumachike automator as composable tools for AI agents (alongside Gmail, Google Sheets, or Discord MCPs), register [`mcp_server.py`](./mcp_server.py) in your MCP client config:
+
+```json
+{
+  "mcpServers": {
+    "eplus-auto-balloter": {
+      "command": "uv",
+      "args": ["--directory", "/path/to/Auto-Balloter", "run", "mcp_server.py"],
+      "env": {
+        "EPLUS_USERNAME": "you@example.com",
+        "EPLUS_KEYCHAIN_SERVICE": "eplus-auto-balloter"
+      }
+    }
+  }
+}
+```
+
+Credentials are read from `EPLUS_USERNAME` / `EPLUS_PASSWORD` (or macOS Keychain via `EPLUS_KEYCHAIN_SERVICE`) inside the server process—never passed as LLM tool arguments. Tools include `sim_status`, `sim_boot`, `sim_screenshot`, `sim_page_summary`, `eplus_open_url`, `eplus_submit_ballot` (with `dry_run=True` and non-blocking `OTP_REQUIRED` responses), `eplus_submit_otp`, `eplus_check_history`, `eplus_logout`, and `balloter_close_session`.
+
 ### Agent Skill
-This repository also includes a workspace Agent Skill at [`.agents/skills/eplus-sumachike-balloter/SKILL.md`](./.agents/skills/eplus-sumachike-balloter/SKILL.md) so AI coding agents (Antigravity, Claude Code, Codex, etc.) can automatically discover and run the iOS Simulator Sumachike workflow, including first-time email OTP verification via `--otp-file`.
+This repository also includes a workspace Agent Skill at [`.agents/skills/eplus-sumachike-balloter/SKILL.md`](./.agents/skills/eplus-sumachike-balloter/SKILL.md) so AI coding agents (Antigravity, Claude Code, Codex, etc.) can automatically discover and run the iOS Simulator Sumachike workflow, including first-time email OTP verification via `--otp-file` or the MCP server.
 
 # Config file
 This scripts uses a [TOML](https://toml.io/en/) config format

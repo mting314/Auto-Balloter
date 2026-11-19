@@ -20,12 +20,16 @@ import time
 import tomllib
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
 
 APPIUM_URL = "http://127.0.0.1:4723"
+
+
+class EmailOTPRequiredError(RuntimeError):
+    """Raised when defer_otp=True and E+ requires a 6-digit メールアドレス認証 code."""
 
 
 def xpath_literal(value: str) -> str:
@@ -79,12 +83,14 @@ class IOSSafariAutomator:
         otp_file: Optional[str] = None,
         otp_cmd: Optional[str] = None,
         otp_timeout: int = 300,
+        defer_otp: bool = False,
     ):
         self.udid = udid
         self.appium_url = appium_url.rstrip("/")
         self.otp_file = otp_file
         self.otp_cmd = otp_cmd
         self.otp_timeout = otp_timeout
+        self.defer_otp = defer_otp
         ensure_appium_running(self.appium_url)
         self._owns_session = session_id is None
         self.session_id = session_id or self._create_session()
@@ -270,7 +276,11 @@ class IOSSafariAutomator:
         """Obtain the 6-digit E+ email verification code via --otp-cmd, --otp-file, or stdin."""
         # 1. Command hook (e.g., Gmail CLI / agent script returning the 6-digit code)
         if self.otp_cmd:
-            print("  Running --otp-cmd to retrieve 6-digit E+ verification code...", flush=True)
+            print(
+                "  Running --otp-cmd to retrieve 6-digit E+ verification code...",
+                file=sys.stderr,
+                flush=True,
+            )
             out = subprocess.check_output(
                 self.otp_cmd,
                 shell=True,
@@ -284,7 +294,14 @@ class IOSSafariAutomator:
                 )
             return match.group(1)
 
-        # 2. File polling hook (for AI agents that pause, ask the user / read email, and write the code)
+        # 2. Non-blocking deferred mode (used by MCP server so caller can invoke eplus_submit_otp)
+        if self.defer_otp:
+            raise EmailOTPRequiredError(
+                "E+ requires a 6-digit email verification code (メールアドレス認証). "
+                "Retrieve the code from email and call eplus_submit_otp(otp_code=...)."
+            )
+
+        # 3. File polling hook (for AI agents that pause, ask the user / read email, and write the code)
         if self.otp_file:
             otp_path = Path(self.otp_file).expanduser()
             if otp_path.is_symlink():
@@ -300,6 +317,7 @@ class IOSSafariAutomator:
             print(
                 f"\n>>> [OTP REQUIRED] E+ sent a 6-digit verification code to your email.\n"
                 f">>> Write the 6-digit code to {otp_path} (waiting up to {self.otp_timeout}s)... <<<",
+                file=sys.stderr,
                 flush=True,
             )
             deadline = time.time() + self.otp_timeout
@@ -315,22 +333,68 @@ class IOSSafariAutomator:
                 time.sleep(1.0)
             raise TimeoutError(f"Timed out waiting for 6-digit OTP in {otp_path}")
 
-        # 3. Interactive terminal prompt
+        # 4. Interactive terminal prompt
         if sys.stdin.isatty():
             print(
                 "\n>>> [OTP REQUIRED] E+ sent a 6-digit verification code (メールアドレス認証) to your email. <<<",
+                file=sys.stderr,
                 flush=True,
             )
             while True:
                 code = input("Enter 6-digit E+ verification code: ").strip()
                 if re.fullmatch(r"\d{6}", code):
                     return code
-                print("Please enter exactly 6 digits.")
+                print("Please enter exactly 6 digits.", file=sys.stderr)
 
         raise RuntimeError(
             "E+ requires first-time email verification (メールアドレス認証), "
             "but stdin is not interactive and neither --otp-file nor --otp-cmd was provided."
         )
+
+    def submit_email_otp(self, otp_code: str) -> Tuple[bool, str]:
+        """Enter a 6-digit code into the active メールアドレス認証 page and submit 登録.
+
+        Returns (landed_on_ballot, status_message).
+        """
+        cleaned = otp_code.strip()
+        if not re.fullmatch(r"\d{6}", cleaned):
+            raise ValueError("otp_code must be exactly 6 digits")
+
+        self.dismiss_save_password_sheet()
+        logging.info("<Auth> Submitting 6-digit email verification code...")
+
+        tf = self.find("xpath", "//XCUIElementTypeTextField[@name='認証コード']", timeout=10.0)
+        if not tf:
+            # Fallback: first text field that is not Safari's address bar
+            for candidate in self.find_all("class name", "XCUIElementTypeTextField"):
+                if self.attr(candidate, "name") != "TabBarItemTitle":
+                    tf = candidate
+                    break
+        if not tf:
+            raise RuntimeError("Could not find 認証コード text field on メールアドレス認証 page")
+
+        self.type_text(tf, cleaned)
+        self.dismiss_keyboard()
+        time.sleep(0.6)
+
+        reg_btn = self.find("xpath", "//XCUIElementTypeButton[@name='登録']", timeout=10.0)
+        if not reg_btn:
+            raise RuntimeError("Could not find 登録 submit button on メールアドレス認証 page")
+        self.click(reg_btn)
+        time.sleep(5.0)
+        self.dismiss_save_password_sheet()
+
+        # Check whether E+ redirected straight to sp.atom.eplus.jp or stalled on member.eplus.jp
+        post_src = self.source()
+        if "希望席種" in post_src or "選択して下さい" in post_src or "sp.atom.eplus.jp" in post_src:
+            return True, "VERIFIED_ON_BALLOT_PAGE"
+        if "メールアドレス認証" in post_src:
+            raise RuntimeError(
+                "Email verification code was rejected or expired; still on メールアドレス認証"
+            )
+
+        # Device is now verified on member.eplus.jp, but redirect stalled on a blank transition page
+        return False, "VERIFIED_READY_TO_RESUME"
 
     def _complete_email_verification(self) -> bool:
         """Handle E+'s first-time メールアドレス認証 screen (including extra-auth modal & keyboard)."""
@@ -349,38 +413,86 @@ class IOSSafariAutomator:
             return True
 
         otp_code = self._obtain_email_otp()
-        logging.info("<Auth> Submitting 6-digit email verification code...")
+        landed_on_ballot, _ = self.submit_email_otp(otp_code)
+        return landed_on_ballot
 
-        tf = self.find("xpath", "//XCUIElementTypeTextField[@name='認証コード']", timeout=10.0)
-        if not tf:
-            # Fallback: first text field that is not Safari's address bar
-            for candidate in self.find_all("class name", "XCUIElementTypeTextField"):
-                if self.attr(candidate, "name") != "TabBarItemTitle":
-                    tf = candidate
-                    break
-        if not tf:
-            raise RuntimeError("Could not find 認証コード text field on メールアドレス認証 page")
+    def page_summary(self, max_items: int = 80) -> Dict[str, Any]:
+        """Return a concise structured summary of visible text and interactive controls."""
+        src = self.source()
+        texts: List[str] = []
+        buttons: List[str] = []
+        links: List[str] = []
+        dropdowns: List[str] = []
+        url_hint = ""
+        try:
+            root = ET.fromstring(src)
+            for el in root.iter():
+                tag = el.tag
+                name = (el.attrib.get("name") or "").strip()
+                val = (el.attrib.get("value") or "").strip()
+                if tag == "XCUIElementTypeTextField" and name == "TabBarItemTitle":
+                    url_hint = val
+                elif tag == "XCUIElementTypeStaticText":
+                    txt = val or name
+                    if txt and txt not in texts and len(texts) < max_items:
+                        texts.append(txt)
+                elif tag == "XCUIElementTypeButton":
+                    if name and name not in buttons and len(buttons) < 40:
+                        buttons.append(name)
+                elif tag == "XCUIElementTypeLink":
+                    if name and name not in links and len(links) < 40:
+                        links.append(name)
+                elif tag == "XCUIElementTypeOther" and (
+                    "選択して下さい" in val or "-----" in val
+                ):
+                    if val not in dropdowns and len(dropdowns) < 20:
+                        dropdowns.append(val)
+        except Exception as exc:
+            logging.warning(f"<Appium> Failed to parse source XML: {exc}")
 
-        self.type_text(tf, otp_code)
-        self.dismiss_keyboard()
-        time.sleep(0.6)
+        return {
+            "url_hint": url_hint,
+            "texts": texts,
+            "buttons": buttons,
+            "links": links,
+            "dropdowns": dropdowns,
+        }
 
-        reg_btn = self.find("xpath", "//XCUIElementTypeButton[@name='登録']", timeout=10.0)
-        if not reg_btn:
-            raise RuntimeError("Could not find 登録 submit button on メールアドレス認証 page")
-        self.click(reg_btn)
-        time.sleep(5.0)
-        self.dismiss_save_password_sheet()
-
-        # Check whether E+ redirected straight to sp.atom.eplus.jp or stalled on member.eplus.jp
-        post_src = self.source()
-        if "希望席種" in post_src or "選択して下さい" in post_src or "sp.atom.eplus.jp" in post_src:
-            return True
-        if "メールアドレス認証" in post_src:
-            raise RuntimeError("Email verification code was rejected or expired; still on メールアドレス認証")
-
-        # Device is now verified on member.eplus.jp, but redirect stalled on a blank transition page
-        return False
+    def check_application_history(
+        self,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Open E+ 申込み履歴 (https://eplus.jp/jyoukyou/), sign in if prompted, and summarize."""
+        self.open_url("https://eplus.jp/jyoukyou/")
+        src = self.source()
+        if "ログイン" in src:
+            id_tf = self.find("xpath", "//XCUIElementTypeTextField[@name='ID']", timeout=4.0)
+            if not id_tf:
+                login_link = self.find("accessibility id", "ログイン画面へ", timeout=3.0)
+                if login_link:
+                    self.click(login_link)
+                    time.sleep(3.5)
+                    id_tf = self.find("xpath", "//XCUIElementTypeTextField[@name='ID']", timeout=5.0)
+            if id_tf and username and password:
+                self.type_text(id_tf, username)
+                pw_tf = self.find(
+                    "xpath", "//XCUIElementTypeSecureTextField[@name='パスワード']", timeout=10.0
+                )
+                if pw_tf:
+                    self.type_text(pw_tf, password)
+                login_btn = self.find(
+                    "xpath", "//XCUIElementTypeButton[@name='ログイン']", timeout=10.0
+                )
+                if login_btn:
+                    self.click(login_btn)
+                time.sleep(5.0)
+                self.dismiss_save_password_sheet()
+                post_src = self.source()
+                if "メールアドレス認証" in post_src or "追加認証が必要です" in post_src:
+                    self._complete_email_verification()
+                    self.open_url("https://eplus.jp/jyoukyou/")
+        return self.page_summary(max_items=120)
 
     def _find_stop_next_button(self, session_name: str) -> Optional[str]:
         """Match the 次へ button belonging to session_name dynamically using XML y-coordinates."""
@@ -477,7 +589,7 @@ class IOSSafariAutomator:
         stop_btn = self._find_stop_next_button(session_name)
         if not stop_btn:
             return False, f"No 次へ button found for stop '{session_name}'"
-        print(f"  Clicking 次へ for {session_name}", flush=True)
+        print(f"  Clicking 次へ for {session_name}", file=sys.stderr, flush=True)
         self.click(stop_btn)
         time.sleep(4.0)
         return True, "OK"
@@ -510,9 +622,11 @@ class IOSSafariAutomator:
         username: Optional[str] = None,
         password: Optional[str] = None,
         screenshot_prefix: Optional[str] = None,
+        dry_run: bool = False,
     ) -> Tuple[bool, str]:
         print(
-            f"\n=== Starting application: Code={code}, Stop={session_name}, Qty={quantity} ===",
+            f"\n=== Starting application: Code={code}, Stop={session_name}, Qty={quantity}, DryRun={dry_run} ===",
+            file=sys.stderr,
             flush=True,
         )
         ok, status = self._open_and_enter_serial_and_stop(entry_url, code, session_name)
@@ -615,6 +729,17 @@ class IOSSafariAutomator:
         submit = self.find("xpath", "//XCUIElementTypeLink[@name='同意して申込み']", timeout=10.0)
         if not submit:
             return False, "Could not find 同意して申込み button"
+
+        if dry_run:
+            if screenshot_prefix:
+                self.screenshot(f"{screenshot_prefix}_{code}_{session_name}_dryrun.png")
+            print(
+                f"  [DRY RUN] Ready to submit {code} -> {session_name} (stopped before 同意して申込み)",
+                file=sys.stderr,
+                flush=True,
+            )
+            return True, "DRY_RUN_READY"
+
         self.click(submit)
         time.sleep(5.0)
 
@@ -628,7 +753,7 @@ class IOSSafariAutomator:
         )
         if is_completed:
             receipt = self.extract_receipt_number(done_src)
-            print(f"  [SUCCESS] {code} -> {session_name} ({receipt})", flush=True)
+            print(f"  [SUCCESS] {code} -> {session_name} ({receipt})", file=sys.stderr, flush=True)
             return True, receipt
         return False, "Did not see 申込完了 confirmation on final page"
 
