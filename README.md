@@ -63,11 +63,13 @@ uv run ios_balloter.py --otp-cmd "your-gmail-otp-helper"
 ```
 
 ### Credential Safety
-Because `config.toml` is tracked in git, either keep placeholder credentials in `config.toml` and pass your real login via environment variables (`EPLUS_USERNAME` / `EPLUS_PASSWORD`), or mark your local copy untracked with:
+Store your E+ password in the macOS Keychain instead of `config.toml`:
 
 ```bash
-git update-index --skip-worktree config.toml
+security add-generic-password -U -s eplus-auto-balloter -a you@example.com -w   # prompts for the password
 ```
+
+Then reference it per account in `config.toml` with `Credentials = { username = "you@example.com", keychain = "eplus-auto-balloter" }`. Each `[[Ballots]]` entry can point at its own Keychain account, which is how multiple E+ accounts are supported. `EPLUS_USERNAME` / `EPLUS_PASSWORD` environment variables still work as a single-account fallback.
 
 ### MCP Server (`mcp_server.py`)
 To expose the iOS Simulator Sumachike automator as composable tools for AI agents (alongside Gmail, Google Sheets, or Discord MCPs), register [`mcp_server.py`](./mcp_server.py) in your MCP client config:
@@ -77,17 +79,13 @@ To expose the iOS Simulator Sumachike automator as composable tools for AI agent
   "mcpServers": {
     "eplus-auto-balloter": {
       "command": "uv",
-      "args": ["--directory", "/path/to/Auto-Balloter", "run", "mcp_server.py"],
-      "env": {
-        "EPLUS_USERNAME": "you@example.com",
-        "EPLUS_KEYCHAIN_SERVICE": "eplus-auto-balloter"
-      }
+      "args": ["--directory", "/path/to/Auto-Balloter", "run", "mcp_server.py"]
     }
   }
 }
 ```
 
-Credentials are read from `EPLUS_USERNAME` / `EPLUS_PASSWORD` (or macOS Keychain via `EPLUS_KEYCHAIN_SERVICE`) inside the server process—never passed as LLM tool arguments. Tools include `sim_status`, `sim_boot`, `sim_screenshot`, `sim_page_summary`, `eplus_open_url`, `eplus_submit_ballot` (with `dry_run=True` and non-blocking `OTP_REQUIRED` responses), `eplus_submit_otp`, `eplus_check_history`, `eplus_logout`, and `balloter_close_session`.
+Credentials are read inside the server process from the macOS Keychain (service `eplus-auto-balloter` by default, or each `[[Ballots]]` entry's `keychain` key), never passed as LLM tool arguments. Tools include `sim_status`, `sim_boot`, `sim_screenshot`, `sim_page_summary`, `eplus_open_url`, `eplus_submit_ballot` (with `dry_run=True` and non-blocking `OTP_REQUIRED` responses), `eplus_submit_otp`, `eplus_check_history`, `eplus_logout`, and `balloter_close_session`.
 
 ### Agent Skill
 This repository also includes a workspace Agent Skill at [`.agents/skills/eplus-sumachike-balloter/SKILL.md`](./.agents/skills/eplus-sumachike-balloter/SKILL.md) so AI coding agents (Antigravity, Claude Code, Codex, etc.) can automatically discover and run the iOS Simulator Sumachike workflow, including first-time email OTP verification via `--otp-file` or the MCP server.

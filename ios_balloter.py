@@ -825,8 +825,7 @@ def main() -> None:
             )
         ballots = [ballots[args.account_index]]
 
-    env_username = os.environ.get("EPLUS_USERNAME")
-    env_password = os.environ.get("EPLUS_PASSWORD")
+    from credentials import resolve_credentials
 
     results: List[Tuple[str, str, bool, str]] = []
     previous_username: Optional[str] = None
@@ -840,8 +839,13 @@ def main() -> None:
     ) as auto:
         for ballot in ballots:
             creds = ballot["Credentials"]
-            username = env_username or creds["username"]
-            password = env_password or creds["password"]
+            username, password = resolve_credentials(creds)
+            if not (username and password):
+                raise RuntimeError(
+                    "No E+ credentials found. Store them in Keychain with:\n"
+                    "  security add-generic-password -U -s eplus-auto-balloter -a you@example.com -w\n"
+                    "and set Credentials = { keychain = \"eplus-auto-balloter\" } in config.toml"
+                )
 
             if previous_username is not None and username != previous_username:
                 auto.logout()

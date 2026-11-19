@@ -11,9 +11,10 @@ DeliveryMethod = "sumachike"
 # Supported options: "sumachike" (selects スマチケ if a delivery radio button is shown), "default"
 
 [[Ballots]]
-Credentials = { username = "an@example.com", password = "NonakaCocona" }
-# The login info for your eplus account.
-# Tip: To avoid committing real credentials, leave placeholders here and set EPLUS_USERNAME / EPLUS_PASSWORD in your shell.
+Credentials = { username = "an@example.com", keychain = "eplus-auto-balloter" }
+# The login info for your eplus account. The password is read from the macOS Keychain, never from this file.
+# Store it once with:  security add-generic-password -U -s eplus-auto-balloter -a an@example.com -w
+# (Legacy: you can still set password = "..." here, or use EPLUS_USERNAME / EPLUS_PASSWORD env vars.)
 
 Codes = ["aaa", "bbb"]
 # All the serial codes you want to apply with for this specific account

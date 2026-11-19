@@ -37,6 +37,9 @@ from ios_balloter import (
     ensure_appium_running,
 )
 
+from credentials import resolve_credentials
+
+DEFAULT_KEYCHAIN_SERVICE = "eplus-auto-balloter"
 CACHE_DIR = Path.home() / ".cache" / "auto-balloter"
 SCREENSHOT_DIR = CACHE_DIR / "screenshots"
 ALLOWED_EPLUS_DOMAINS = ("eplus.jp",)
@@ -65,46 +68,18 @@ def _resolve_credentials(
     config_path: str = "config.toml",
     account_index: int = 0,
 ) -> Tuple[Optional[str], Optional[str]]:
-    """Resolve E+ credentials from env vars, macOS Keychain, or config.toml (never LLM args)."""
-    env_user = os.environ.get("EPLUS_USERNAME")
-    env_pass = os.environ.get("EPLUS_PASSWORD")
-    if env_user and env_pass:
-        return env_user, env_pass
-
-    keychain_service = os.environ.get("EPLUS_KEYCHAIN_SERVICE")
-    if keychain_service and env_user:
-        try:
-            pw = subprocess.check_output(
-                [
-                    "security",
-                    "find-generic-password",
-                    "-s",
-                    keychain_service,
-                    "-a",
-                    env_user,
-                    "-w",
-                ],
-                text=True,
-                stderr=subprocess.DEVNULL,
-            ).strip()
-            if pw:
-                return env_user, pw
-        except Exception as exc:
-            logging.warning(f"<MCP> macOS Keychain lookup failed: {exc}")
-
+    """Resolve E+ credentials from macOS Keychain, env vars, or config.toml (never LLM args)."""
+    creds_cfg: Dict[str, Any] = {}
     cfg_file = Path(config_path)
     if cfg_file.exists():
         with cfg_file.open("rb") as fd:
             cfg = tomllib.load(fd)
         ballots = cfg.get("Ballots") or []
         if 0 <= account_index < len(ballots):
-            creds = ballots[account_index].get("Credentials") or {}
-            user = env_user or creds.get("username")
-            pw = env_pass or creds.get("password")
-            if user and pw and user != "an@example.com":
-                return user, pw
-
-    return env_user, env_pass
+            creds_cfg = ballots[account_index].get("Credentials") or {}
+    if not creds_cfg.get("keychain") and not os.environ.get("EPLUS_KEYCHAIN_SERVICE"):
+        creds_cfg = {**creds_cfg, "keychain": DEFAULT_KEYCHAIN_SERVICE}
+    return resolve_credentials(creds_cfg)
 
 
 class BalloterSessionManager:
@@ -207,10 +182,7 @@ def sim_status() -> Dict[str, Any]:
         "appium_url": SESSION.appium_url,
         "appium_reachable": appium_ok,
         "appium_error": appium_error,
-        "credentials_configured": bool(
-            os.environ.get("EPLUS_USERNAME")
-            and (os.environ.get("EPLUS_PASSWORD") or os.environ.get("EPLUS_KEYCHAIN_SERVICE"))
-        ),
+        "credentials_configured": all(_resolve_credentials()),
     }
 
 

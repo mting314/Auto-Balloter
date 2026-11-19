@@ -11,6 +11,8 @@ import unicodedata
 import certifi
 os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 
+from credentials import resolve_credentials
+
 import undetected_chromedriver as uc
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -709,8 +711,7 @@ def start_single_ballot_process(
                         logger.info(f"<Error> Code {code} has been used for {session_name} before.")
                         continue
 
-                username = os.environ.get("EPLUS_USERNAME") or ballot_info["Credentials"]["username"]
-                password = os.environ.get("EPLUS_PASSWORD") or ballot_info["Credentials"]["password"]
+                username, password = resolve_credentials(ballot_info.get("Credentials"))
                 login(
                     driver,
                     username,
