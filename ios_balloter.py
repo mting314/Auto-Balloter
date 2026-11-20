@@ -175,6 +175,7 @@ class IOSSafariAutomator:
         self.otp_cmd = otp_cmd
         self.otp_timeout = otp_timeout
         self.defer_otp = defer_otp
+        self._last_login_ts: float = 0.0
         ensure_appium_running(self.appium_url)
         self._owns_session = session_id is None
         self.session_id = session_id or self._create_session()
@@ -298,12 +299,32 @@ class IOSSafariAutomator:
             logging.warning(f"<Appium> tap_xy({x}, {y}) returned HTTP {r.status_code}")
         return r.status_code
 
-    def type_text(self, eid: str, text: str) -> None:
+    def type_text(self, eid: str, text: str, is_secure: bool = False) -> None:
+        if is_secure:
+            # SecureTextField masks its value attribute; use WDA /value directly once (no double-typing)
+            r = requests.post(f"{self.base}/element/{eid}/value", json={"text": text}, timeout=20)
+            if not r.ok:
+                logging.warning(f"<Appium> type_text(secure {eid}) returned HTTP {r.status_code}")
+            time.sleep(0.4)
+            return
+
+        before = self.attr(eid, "value")
         self.click(eid)
+        time.sleep(0.5)
+        self.dismiss_autofill_sheet()
+        time.sleep(0.2)
+        # Try mobile: keys first (avoids WDA re-tapping and re-opening iOS 26's autofill sheet)
+        r = requests.post(
+            f"{self.base}/execute/sync",
+            json={"script": "mobile: keys", "args": [{"keys": list(text)}]},
+            timeout=20,
+        )
         time.sleep(0.3)
-        r = requests.post(f"{self.base}/element/{eid}/value", json={"text": text}, timeout=20)
-        if not r.ok:
-            logging.warning(f"<Appium> type_text({eid}) returned HTTP {r.status_code}")
+        after = self.attr(eid, "value")
+        if not r.ok or after == before or not after:
+            r2 = requests.post(f"{self.base}/element/{eid}/value", json={"text": text}, timeout=20)
+            if not r2.ok:
+                logging.warning(f"<Appium> type_text({eid}) returned HTTP {r2.status_code}")
         time.sleep(0.4)
 
     def swipe(self, direction: str = "up") -> None:
@@ -325,19 +346,19 @@ class IOSSafariAutomator:
             time.sleep(0.5)
 
     def dismiss_save_password_sheet(self) -> None:
-        """Dismiss the iOS 'Save Password?' sheet if it appears after first-time login."""
+        """Dismiss the iOS 'Save Password?' sheet/alert if it appears during or after login."""
+        not_now = self.find(
+            "xpath",
+            "//XCUIElementTypeButton[@name='Not Now' or @name='今はしない']",
+            timeout=1.5,
+        )
+        if not_now:
+            self.click(not_now)
+            time.sleep(0.8)
+            return
         src = self.source()
-        if "Save Password?" in src or "パスワードを保存" in src:
-            not_now = self.find(
-                "xpath",
-                "//XCUIElementTypeButton[@name='Not Now' or @name='今はしない']",
-                timeout=2.0,
-            )
-            if not_now:
-                self.click(not_now)
-            else:
-                # Fallback tap on the bottom button of the iOS Save Password modal
-                self.tap_xy(201, 692)
+        if any(k in src for k in ("Save Password?", "Update Password?", "パスワードを保存", "パスワードをアップデート")):
+            requests.post(f"{self.base}/alert/dismiss", json={}, timeout=5)
             time.sleep(0.8)
 
     def attr(self, eid: str, name: str) -> str:
@@ -365,11 +386,15 @@ class IOSSafariAutomator:
                 file=sys.stderr,
                 flush=True,
             )
+            cmd_env = os.environ.copy()
+            if self._last_login_ts > 0:
+                cmd_env["EPLUS_OTP_MIN_TS"] = str(int(self._last_login_ts - 5))
             out = subprocess.check_output(
                 self.otp_cmd,
                 shell=True,
                 text=True,
                 timeout=self.otp_timeout,
+                env=cmd_env,
             ).strip()
             match = re.search(r"\b(\d{6})\b", out)
             if not match:
@@ -550,7 +575,9 @@ class IOSSafariAutomator:
         """Open E+ 申込み履歴 (https://eplus.jp/jyoukyou/), sign in if prompted, and summarize."""
         self.open_url("https://eplus.jp/jyoukyou/")
         if self.login_if_needed(username, password):
-            self.open_url("https://eplus.jp/jyoukyou/")
+            time.sleep(2.0)
+            if "申込み履歴" not in self.source():
+                self.open_url("https://eplus.jp/jyoukyou/")
         return self.page_summary(max_items=120)
 
     def dismiss_autofill_sheet(self) -> None:
@@ -561,10 +588,28 @@ class IOSSafariAutomator:
                 self.click(close_btn)
                 time.sleep(0.8)
 
+    def _fill_and_submit_login(self, id_tf: str, username: str, password: str) -> None:
+        """Fill member.eplus.jp ID & password reliably even if iOS autofill intercepts focus."""
+        self.dismiss_save_password_sheet()
+        self.dismiss_autofill_sheet()
+        self.type_text(id_tf, username)
+
+        pw_tf = self.find("xpath", "//XCUIElementTypeSecureTextField[@name='パスワード']", timeout=10.0)
+        if pw_tf:
+            self.type_text(pw_tf, password, is_secure=True)
+        self.dismiss_keyboard()
+        login_btn = self.find("xpath", "//XCUIElementTypeButton[@name='ログイン']", timeout=10.0)
+        if login_btn:
+            self._last_login_ts = time.time()
+            self.click(login_btn)
+        time.sleep(5.0)
+        self.dismiss_save_password_sheet()
+
     def login_if_needed(self, username: Optional[str], password: Optional[str]) -> bool:
         """Sign in on member.eplus.jp if the current page shows a login form. Returns True if it logged in."""
+        self.dismiss_save_password_sheet()
         self.dismiss_autofill_sheet()
-        id_tf = self.find("xpath", "//XCUIElementTypeTextField[@name='ID']", timeout=4.0)
+        id_tf = self.find("xpath", "//XCUIElementTypeTextField[@name='ID']", timeout=6.0)
         if not id_tf:
             login_link = self.find("accessibility id", "ログイン画面へ", timeout=2.0)
             if not login_link:
@@ -572,20 +617,11 @@ class IOSSafariAutomator:
             self.click(login_link)
             time.sleep(3.5)
             self.dismiss_autofill_sheet()
-            id_tf = self.find("xpath", "//XCUIElementTypeTextField[@name='ID']", timeout=5.0)
+            id_tf = self.find("xpath", "//XCUIElementTypeTextField[@name='ID']", timeout=6.0)
         if not (id_tf and username and password):
             return False
 
-        self.type_text(id_tf, username)
-        pw_tf = self.find("xpath", "//XCUIElementTypeSecureTextField[@name='パスワード']", timeout=10.0)
-        if pw_tf:
-            self.type_text(pw_tf, password)
-        self.dismiss_keyboard()
-        login_btn = self.find("xpath", "//XCUIElementTypeButton[@name='ログイン']", timeout=10.0)
-        if login_btn:
-            self.click(login_btn)
-        time.sleep(5.0)
-        self.dismiss_save_password_sheet()
+        self._fill_and_submit_login(id_tf, username, password)
         post_src = self.source()
         if "メールアドレス認証" in post_src or "追加認証が必要です" in post_src:
             self._complete_email_verification()
@@ -830,19 +866,7 @@ class IOSSafariAutomator:
                 time.sleep(4.0)
             id_tf = self.find("xpath", "//XCUIElementTypeTextField[@name='ID']", timeout=6.0)
             if id_tf and username and password:
-                self.type_text(id_tf, username)
-                pw_tf = self.find(
-                    "xpath", "//XCUIElementTypeSecureTextField[@name='パスワード']", timeout=10.0
-                )
-                if pw_tf:
-                    self.type_text(pw_tf, password)
-                login_btn = self.find(
-                    "xpath", "//XCUIElementTypeButton[@name='ログイン']", timeout=10.0
-                )
-                if login_btn:
-                    self.click(login_btn)
-                time.sleep(5.0)
-                self.dismiss_save_password_sheet()
+                self._fill_and_submit_login(id_tf, username, password)
 
                 post_login_src = self.source()
                 if "メールアドレス認証" in post_login_src or "追加認証が必要です" in post_login_src:

@@ -62,8 +62,20 @@ uv run ios_balloter.py --list-companions
 
 # Agent / non-interactive first-time email OTP (メールアドレス認証) support:
 uv run ios_balloter.py --otp-file ~/.cache/auto-balloter/otp.txt
-# or fetch automatically via a trusted local command:
-uv run ios_balloter.py --otp-cmd "your-gmail-otp-helper"
+# or auto-fetch via Gmail (`gmail_eplus.py`, requires the `gmail` CLI):
+uv run ios_balloter.py --otp-cmd "uv run gmail_eplus.py otp --poll 90"
+```
+
+### Gmail Auto-OTP, Receipts & Lottery Results (`gmail_eplus.py`)
+[`gmail_eplus.py`](./gmail_eplus.py) uses `gmail readonly read` to extract E+ verification codes, `申込み完了` confirmation receipts, and `当選`/`落選` lottery results (including conbini payment deadlines and slip numbers):
+
+```bash
+# Poll Gmail for a fresh 6-digit E+ OTP (automatically ignores stale codes via EPLUS_OTP_MIN_TS):
+uv run gmail_eplus.py otp --poll 90
+
+# List parsed E+ 申込み完了 receipts or lottery results as JSON:
+uv run gmail_eplus.py receipts --filter Roselia --max 5
+uv run gmail_eplus.py results --max 5
 ```
 
 ### Credential Safety
@@ -89,7 +101,7 @@ To expose the iOS Simulator Sumachike automator as composable tools for AI agent
 }
 ```
 
-Credentials are read inside the server process from the macOS Keychain (service `eplus-auto-balloter` by default, or each `[[Ballots]]` entry's `keychain` key), never passed as LLM tool arguments. Tools include `sim_status`, `sim_boot`, `sim_screenshot`, `sim_page_summary`, `eplus_open_url`, `eplus_list_companions`, `eplus_submit_ballot` (with Renban `companions`, `delivery_keyword`, `dry_run=True`, duplicate-companion protection, and non-blocking `OTP_REQUIRED` responses), `eplus_submit_otp`, `eplus_check_history`, `eplus_logout`, `balloter_close_session`, plus job-list/Google Sheets planner tools (`plan_from_sheet_rows`, `plan_allocate`, `plan_validate`, `plan_execute_next`).
+Credentials are read inside the server process from the macOS Keychain (service `eplus-auto-balloter` by default, or each `[[Ballots]]` entry's `keychain` key), never passed as LLM tool arguments. Tools include `sim_status`, `sim_boot`, `sim_screenshot`, `sim_page_summary`, `eplus_open_url`, `eplus_list_companions`, `eplus_submit_ballot` (with Renban `companions`, `delivery_keyword`, `dry_run=True`, duplicate-companion protection, and non-blocking `OTP_REQUIRED` responses), `eplus_submit_otp`, `eplus_check_history`, `eplus_logout`, `balloter_close_session`, plus job-list/Google Sheets planner tools (`plan_from_sheet_rows`, `plan_allocate`, `plan_validate`, `plan_execute_next`), and Gmail tools (`eplus_gmail_fetch_otp`, `eplus_gmail_receipts`, `eplus_gmail_results`).
 
 ### Multi-Account Job List & Serial-Allocation Planner (`planner.py`)
 For multi-account group buys or tracking ballots in Google Sheets, use [`planner.py`](./planner.py) (see [`plan.example.toml`](./plan.example.toml) for the schema; keep real plans under gitignored `plans/` or `~/.cache/auto-balloter/plans/`):

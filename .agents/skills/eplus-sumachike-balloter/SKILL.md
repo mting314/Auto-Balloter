@@ -71,10 +71,10 @@ The first time you sign into `member.eplus.jp` on a newly booted iOS Simulator, 
      ```
    - `ios_balloter.py` immediately detects the file, deletes it, enters the code, completes verification, and finishes all remaining ballots automatically (subsequent ballots reuse the verified Mobile Safari session without needing another OTP).
 
-2. **Automated Email Fetch Hook (`--otp-cmd`):**
-   If you have a trusted local CLI or script that fetches the latest E+ 6-digit code from your inbox, pass:
+2. **Automated Gmail OTP Hook (`--otp-cmd`):**
+   Use [`gmail_eplus.py`](../../../gmail_eplus.py) with the `gmail` CLI (`readonly` only). `ios_balloter.py` automatically passes `EPLUS_OTP_MIN_TS` so stale OTP emails are ignored:
    ```bash
-   uv run ios_balloter.py --otp-cmd "your-otp-fetcher-command"
+   uv run ios_balloter.py --otp-cmd "uv run gmail_eplus.py otp --poll 90"
    ```
 
 3. **Interactive Terminal Mode:**
@@ -95,8 +95,8 @@ When running inside an MCP-enabled agent alongside Gmail / Google Sheets / Disco
 1. Call `sim_status()` (and `sim_boot()` if needed) to verify the iPhone Simulator and Appium are ready.
 2. For non-Sumachike Renban ballots, call `eplus_list_companions()` first to verify registered `同行者` names.
 3. Call `eplus_submit_ballot(entry_url, serial_code, session_name, seat_keyword, goods_keyword, quantity, companions=..., delivery_keyword=..., dry_run=True)` to verify the final confirmation screen via `sim_screenshot()`, then re-call with `dry_run=False`.
-4. If `eplus_submit_ballot()` returns `status == "OTP_REQUIRED"`, fetch the 6-digit code from email (e.g., via Gmail MCP or ask the user), call `eplus_submit_otp(otp_code="123456")`, and re-call `eplus_submit_ballot()`.
-5. Call `eplus_check_history()` on results day to inspect `申込み履歴` (`https://eplus.jp/jyoukyou/`).
+4. If `eplus_submit_ballot()` returns `status == "OTP_REQUIRED"`, call `eplus_gmail_fetch_otp(poll_timeout=60)` (or ask the user if it is another person's account), pass the 6-digit code to `eplus_submit_otp(otp_code=...)`, and re-call `eplus_submit_ballot()`.
+5. Call `eplus_check_history()`, `eplus_gmail_receipts()`, and `eplus_gmail_results()` to reconcile receipts, lottery outcomes (`WON`/`LOST`), and conbini payment deadlines (`支払期限` / `払込票番号`).
 6. For multi-account or Google Sheets workflows, use `plan_from_sheet_rows()` / `plan_allocate()` / `plan_validate()` to show the user a validated Markdown plan table for approval before calling `plan_execute_next(plan_path, dry_run=...)`. Each completed job returns `sheet_row` and `row_values` for immediate write-back to Google Sheets, and logs to `~/.cache/auto-balloter/filings.jsonl`.
 7. Credentials come from the macOS Keychain inside the server process (default service `eplus-auto-balloter`), so passwords never enter LLM tool arguments. Never ask the user to paste a password into chat; ask them to run `security add-generic-password -U -s eplus-auto-balloter -a <email> -w` themselves.
 

@@ -31,6 +31,7 @@ import requests
 from mcp.server.mcpserver import Image, MCPServer
 
 from credentials import resolve_credentials
+from gmail_eplus import fetch_latest_otp, fetch_receipts, fetch_results
 from ios_balloter import (
     APPIUM_URL,
     EmailOTPRequiredError,
@@ -729,6 +730,68 @@ def plan_execute_next(
         "remaining_pending": remaining,
         **detail,
     }
+
+
+@mcp.tool()
+def eplus_gmail_fetch_otp(
+    max_age_seconds: int = 600,
+    poll_timeout: int = 0,
+    min_timestamp: float = 0.0,
+    account: str = "",
+) -> Dict[str, Any]:
+    """Fetch the newest 6-digit E+ メールアドレス認証 code from Gmail (strictly readonly).
+
+    Pass poll_timeout (e.g. 60) after triggering login to wait until the new email arrives,
+    or max_age_seconds=0 to inspect the latest historical OTP email.
+    """
+    try:
+        otp = fetch_latest_otp(
+            min_timestamp=min_timestamp if min_timestamp > 0 else None,
+            max_age_seconds=max_age_seconds,
+            poll_timeout=poll_timeout,
+            account=account,
+        )
+    except Exception as exc:
+        return {"status": "FAILED", "detail": str(exc)}
+    if not otp:
+        return {"status": "NOT_FOUND", "detail": "No matching E+ 認証コード通知 email found"}
+    return {"status": "OK", **otp}
+
+
+@mcp.tool()
+def eplus_gmail_receipts(
+    event_filter: str = "",
+    max_results: int = 10,
+    account: str = "",
+) -> Dict[str, Any]:
+    """Read and parse E+ 申込み完了 confirmation emails from Gmail (strictly readonly)."""
+    try:
+        items = fetch_receipts(
+            event_filter=event_filter,
+            max_results=max_results,
+            account=account,
+        )
+    except Exception as exc:
+        return {"status": "FAILED", "detail": str(exc)}
+    return {"status": "OK", "count": len(items), "receipts": items}
+
+
+@mcp.tool()
+def eplus_gmail_results(
+    event_filter: str = "",
+    max_results: int = 10,
+    account: str = "",
+) -> Dict[str, Any]:
+    """Read and parse E+ 当選/落選 lottery result emails (incl. payment deadline & slip number)."""
+    try:
+        items = fetch_results(
+            event_filter=event_filter,
+            max_results=max_results,
+            account=account,
+        )
+    except Exception as exc:
+        return {"status": "FAILED", "detail": str(exc)}
+    return {"status": "OK", "count": len(items), "results": items}
 
 
 @mcp.tool()
