@@ -47,6 +47,7 @@ from planner import (
     EventRules,
     allocate_serials,
     execute_job,
+    extract_eplus_url_from_rows,
     format_plan_markdown,
     jobs_from_sheet_rows,
     jobs_to_sheet_rows,
@@ -518,7 +519,8 @@ def eplus_logout() -> Dict[str, Any]:
 @mcp.tool()
 def plan_from_sheet_rows(
     rows: List[List[Any]],
-    entry_url: str,
+    entry_url: str = "",
+    tab_name: str = "",
     is_sumachike: bool = True,
     max_stops_per_serial: int = 2,
     max_qty_per_ballot: int = 2,
@@ -527,20 +529,23 @@ def plan_from_sheet_rows(
     default_goods: str = "特製グッズ無し",
     save_to_path: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Parse 2D Google Sheets rows (header + data) into a validated ballot plan.
+    """Parse 2D Google Sheets rows (single tab) into a validated ballot plan.
 
-    Accepts raw 2D arrays from Google Sheets MCP, auto-detects English/Japanese headers
-    (Serial/シリアル, Account/アカウント, Stop/公演, Qty/枚数, Companion/同行者, Status, etc.),
-    validates all constraints, and optionally saves the plan to a local TOML/CSV file.
+    Accepts raw 2D arrays from Google Sheets (`gsheets readonly read --json`), auto-detects
+    the header row even below title/URL rows, extracts the eplus.jp URL if omitted, maps
+    English tab names (`Aichi`, `Fukuoka`, etc.) to Japanese stop names, strips inline
+    `(owner)` notes from serial codes, validates all constraints, and optionally saves the plan.
     """
+    resolved_url = entry_url or extract_eplus_url_from_rows(rows)
     try:
-        validated_url = _validate_eplus_url(entry_url)
+        validated_url = _validate_eplus_url(resolved_url)
     except ValueError as exc:
         return {"valid": False, "errors": [str(exc)]}
 
     jobs = jobs_from_sheet_rows(
         rows=rows,
         default_account_id=default_account_id,
+        default_session_name=tab_name,
         default_seat=default_seat,
         default_goods=default_goods,
         is_sumachike=is_sumachike,

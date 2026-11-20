@@ -162,6 +162,11 @@ def validate_plan(
 
         if not job.serial_code.strip():
             errors.append(f"[{job.job_id}] Missing serial_code")
+        elif job.is_pending() and re.search(r"\s", job.serial_code.strip()):
+            warnings.append(
+                f"[{job.job_id}] Serial code {job.serial_code!r} looks like a placeholder (contains spaces); "
+                "replace with the real serial before filing"
+            )
         if not job.session_name.strip():
             errors.append(f"[{job.job_id}] Missing session_name")
         if not (1 <= job.quantity <= rules.max_qty_per_ballot):
@@ -367,11 +372,13 @@ _HEADER_ALIASES: Dict[str, str] = {
     "id": "job_id",
     "account": "account_id",
     "account_id": "account_id",
+    "applicant": "account_id",
     "アカウント": "account_id",
     "filer": "account_id",
     "serial": "serial_code",
     "serial_code": "serial_code",
     "code": "serial_code",
+    "codes": "serial_code",
     "シリアル": "serial_code",
     "シリアルナンバー": "serial_code",
     "stop": "session_name",
@@ -400,6 +407,9 @@ _HEADER_ALIASES: Dict[str, str] = {
     "status": "status",
     "ステータス": "status",
     "状態": "status",
+    "paymentstatus": "payment_status",
+    "payment_status": "payment_status",
+    "payment": "payment_status",
     "receipt": "receipt",
     "受付番号": "receipt",
     "screenshot": "screenshot_path",
@@ -409,60 +419,137 @@ _HEADER_ALIASES: Dict[str, str] = {
     "備考": "notes",
 }
 
+_STOP_ALIASES: Dict[str, str] = {
+    "aichi": "愛知公演",
+    "fukuoka": "福岡公演",
+    "tokyo": "東京公演",
+    "miyagi": "宮城公演",
+    "osaka": "大阪公演",
+    "nagoya": "名古屋公演",
+    "sendai": "仙台公演",
+    "sapporo": "札幌公演",
+    "yokohama": "横浜公演",
+    "saitama": "埼玉公演",
+    "chiba": "千葉公演",
+    "kobe": "神戸公演",
+}
+
 
 def _split_list_cell(val: str) -> List[str]:
     parts = [p.strip() for p in re.split(r"[,;/、]+", val or "") if p.strip()]
     return [p for p in parts if p.lower() not in ("none", "n/a", "-", "0")]
 
 
+def _parse_serial_cell(raw: str) -> Tuple[str, str]:
+    """Extract clean serial code and optional parenthetical owner note (e.g. 'abcd1234 (Alice)')."""
+    text = raw.strip()
+    m = re.match(r"^([A-Za-z0-9_-]{6,32})\s*\(([^)]+)\)\s*$", text)
+    if m:
+        return m.group(1), m.group(2).strip()
+    return text, ""
+
+
+def extract_eplus_url_from_rows(rows: Sequence[Sequence[Any]]) -> str:
+    """Scan top metadata rows for an https://eplus.jp/... URL."""
+    for row in rows[:5]:
+        for cell in row:
+            s = str(cell).strip()
+            if s.startswith("https://") and "eplus.jp" in s:
+                return s
+    return ""
+
+
+def _find_header_row(rows: Sequence[Sequence[Any]]) -> Tuple[int, Dict[int, str]]:
+    """Locate the table header row (even if preceded by title/metadata rows) and map columns."""
+    best_idx = 0
+    best_map: Dict[int, str] = {}
+    for idx, row in enumerate(rows[:12]):
+        cmap: Dict[int, str] = {}
+        for c_idx, cell in enumerate(row):
+            h = str(cell).strip()
+            if not h:
+                continue
+            key = re.sub(r"[\s\-]+", "", h.lower())
+            canonical = _HEADER_ALIASES.get(key) or _HEADER_ALIASES.get(h.lower()) or _HEADER_ALIASES.get(h)
+            if canonical and canonical not in cmap.values():
+                cmap[c_idx] = canonical
+        # A real ballot table header has at least serial_code plus another column
+        if "serial_code" in cmap.values() and len(cmap) > len(best_map):
+            best_idx = idx
+            best_map = cmap
+    return best_idx, best_map
+
+
+def normalize_stop_name(name: str) -> str:
+    """Map common English tab names (e.g. 'Aichi', 'Fukuoka') to E+ Japanese stop labels."""
+    cleaned = name.strip()
+    return _STOP_ALIASES.get(cleaned.lower(), cleaned)
+
+
 def jobs_from_sheet_rows(
     rows: Sequence[Sequence[Any]],
     default_account_id: str = "primary",
+    default_session_name: str = "",
     default_seat: str = "一般指定席",
     default_goods: str = "特製グッズ無し",
     default_quantity: int = 2,
     is_sumachike: bool = True,
 ) -> List[BallotJob]:
-    """Parse a 2D Google Sheets / CSV table (header row + data rows) into BallotJobs."""
+    """Parse a 2D Google Sheets / CSV table into BallotJobs.
+
+    Handles both simple row-1 CSVs and multi-row concert sheets (title/URL on row 1,
+    header row on row N, per-tab stop name via `default_session_name`, `Applicant`/`Codes`
+    headers, inline `serial (owner)` notes, and `Note:` footer rows).
+    """
     if not rows:
         return []
 
-    raw_headers = [str(c).strip() for c in rows[0]]
-    col_map: Dict[int, str] = {}
-    for idx, h in enumerate(raw_headers):
-        key = re.sub(r"[\s\-]+", "", h.lower())
-        canonical = _HEADER_ALIASES.get(key) or _HEADER_ALIASES.get(h.lower()) or _HEADER_ALIASES.get(h)
-        if canonical:
-            col_map[idx] = canonical
+    header_idx, col_map = _find_header_row(rows)
+    if not col_map:
+        return []
 
+    default_stop = normalize_stop_name(default_session_name) if default_session_name else ""
     jobs: List[BallotJob] = []
-    for row_idx, row in enumerate(rows[1:], start=2):
+    for row_idx, row in enumerate(rows[header_idx + 1 :], start=header_idx + 2):
         if not any(str(c).strip() for c in row):
             continue
+        first_cell = str(row[0]).strip() if row else ""
+        if first_cell.lower().startswith("note:") or first_cell.startswith("※"):
+            continue
+
         rec: Dict[str, str] = {}
         for c_idx, field_name in col_map.items():
             if c_idx < len(row):
                 rec[field_name] = str(row[c_idx]).strip()
 
-        serial = rec.get("serial_code", "")
-        stop = rec.get("session_name", "")
-        if not serial and not stop:
+        raw_serial = rec.get("serial_code", "")
+        stop = normalize_stop_name(rec.get("session_name", "")) or default_stop
+        if not raw_serial:
             continue
 
+        serial, owner_note = _parse_serial_cell(raw_serial)
         qty_raw = rec.get("quantity", "")
         qty_match = re.search(r"\d+", qty_raw)
-        qty = int(qty_match.group(0)) if qty_match else default_quantity
-
         comp_list = _split_list_cell(rec.get("companions", ""))
         intended_list = _split_list_cell(rec.get("intended_companions", ""))
-        # On Sumachike sheets, users often put the post-win companion in the "Companion" column
+        if qty_match:
+            qty = int(qty_match.group(0))
+        elif comp_list or intended_list:
+            qty = max(2, len(comp_list or intended_list) + 1)
+        else:
+            qty = default_quantity
+
+        # On Sumachike sheets, users often put the post-win companion in the "Renban"/"Companion" column
         if is_sumachike and comp_list and not intended_list:
             intended_list = comp_list
             comp_list = []
 
+        note_parts = [p for p in (rec.get("notes", ""), rec.get("payment_status", ""), f"owner: {owner_note}" if owner_note else "") if p]
+        tab_prefix = f"{default_session_name.lower().replace(' ', '_')}_" if default_session_name else ""
+
         jobs.append(
             BallotJob(
-                job_id=rec.get("job_id") or f"row_{row_idx}",
+                job_id=rec.get("job_id") or f"{tab_prefix}row_{row_idx}",
                 account_id=rec.get("account_id") or default_account_id,
                 serial_code=serial,
                 session_name=stop,
@@ -474,7 +561,7 @@ def jobs_from_sheet_rows(
                 status=rec.get("status") or "Not filed",
                 receipt=rec.get("receipt", ""),
                 screenshot_path=rec.get("screenshot_path", ""),
-                notes=rec.get("notes", ""),
+                notes=" | ".join(note_parts),
                 sheet_row=row_idx,
             )
         )
