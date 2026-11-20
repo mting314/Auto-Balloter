@@ -53,8 +53,12 @@ appium --port 4723
 # 2. Run all configured ballots (auto-detects the booted iPhone Simulator)
 uv run ios_balloter.py
 
-# Or run specific code:session pairs
+# Or run specific code:session[:companion] pairs (with optional --dry-run)
 uv run ios_balloter.py --pairs <SERIAL>:福岡公演
+uv run ios_balloter.py --pairs "<SERIAL>:昼公演:Demo User" --dry-run
+
+# List registered 同行者 (companions) from member.eplus.jp/update-dokosha:
+uv run ios_balloter.py --list-companions
 
 # Agent / non-interactive first-time email OTP (メールアドレス認証) support:
 uv run ios_balloter.py --otp-file ~/.cache/auto-balloter/otp.txt
@@ -85,7 +89,7 @@ To expose the iOS Simulator Sumachike automator as composable tools for AI agent
 }
 ```
 
-Credentials are read inside the server process from the macOS Keychain (service `eplus-auto-balloter` by default, or each `[[Ballots]]` entry's `keychain` key), never passed as LLM tool arguments. Tools include `sim_status`, `sim_boot`, `sim_screenshot`, `sim_page_summary`, `eplus_open_url`, `eplus_submit_ballot` (with `dry_run=True` and non-blocking `OTP_REQUIRED` responses), `eplus_submit_otp`, `eplus_check_history`, `eplus_logout`, and `balloter_close_session`.
+Credentials are read inside the server process from the macOS Keychain (service `eplus-auto-balloter` by default, or each `[[Ballots]]` entry's `keychain` key), never passed as LLM tool arguments. Tools include `sim_status`, `sim_boot`, `sim_screenshot`, `sim_page_summary`, `eplus_open_url`, `eplus_list_companions`, `eplus_submit_ballot` (with Renban `companions`, `delivery_keyword`, `dry_run=True`, duplicate-companion protection, and non-blocking `OTP_REQUIRED` responses), `eplus_submit_otp`, `eplus_check_history`, `eplus_logout`, and `balloter_close_session`.
 
 ### Agent Skill
 This repository also includes a workspace Agent Skill at [`.agents/skills/eplus-sumachike-balloter/SKILL.md`](./.agents/skills/eplus-sumachike-balloter/SKILL.md) so AI coding agents (Antigravity, Claude Code, Codex, etc.) can automatically discover and run the iOS Simulator Sumachike workflow, including first-time email OTP verification via `--otp-file` or the MCP server.

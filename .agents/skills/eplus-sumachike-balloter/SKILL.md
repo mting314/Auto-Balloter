@@ -51,6 +51,7 @@ Update `config.toml` (never commit real credentials or serial codes to git). Sto
 - `SeatKeyword` / `GoodsKeyword`: Substrings matching the seat tier dropdown (`"一般指定席"`) and goods toggle (`"特製グッズ無し"` or `"特製グッズ付き"`).
 - `Quantity` & `Renban`:
   - **For Sumachike (`スマチケ`):** Set `Quantity = 2` (or `1`) and **`Renban = 0`**. Sumachike does **not** select companions (`同行者`) at application time—you apply for multiple tickets under your own account and distribute (`分配`) them later in the E+ app after winning.
+  - **For non-Sumachike Renban (`連番` / `同行者`):** Set `Quantity = 2` and `Renban = "Family Given"` (or 1-based `No.` from `uv run ios_balloter.py --list-companions` / `eplus_list_companions()`). `ios_balloter.py` matches by NFKC-normalized name in either word order and refuses to submit if a Renban page is missing a companion (`COMPANION_REQUIRED`), if a Sumachike page was mistakenly given a companion (`COMPANION_SELECTOR_NOT_FOUND`), or if the same companion is reused for the same stop (`DUPLICATE_COMPANION`).
 
 ## Running Ballots & Handling First-Time Email OTP (`メールアドレス認証`)
 
@@ -92,10 +93,11 @@ The first time you sign into `member.eplus.jp` on a newly booted iOS Simulator, 
 When running inside an MCP-enabled agent alongside Gmail / Google Sheets / Discord MCPs, start [mcp_server.py](../../../mcp_server.py) (`uv run mcp_server.py`) to use structured tools instead of CLI polling:
 
 1. Call `sim_status()` (and `sim_boot()` if needed) to verify the iPhone Simulator and Appium are ready.
-2. Call `eplus_submit_ballot(entry_url, serial_code, session_name, seat_keyword, goods_keyword, quantity, dry_run=True)` to verify the final confirmation screen via `sim_screenshot()`, then re-call with `dry_run=False`.
-3. If `eplus_submit_ballot()` returns `status == "OTP_REQUIRED"`, fetch the 6-digit code from email (e.g., via Gmail MCP or ask the user), call `eplus_submit_otp(otp_code="123456")`, and re-call `eplus_submit_ballot()`.
-4. Call `eplus_check_history()` on results day to inspect `申込み履歴` (`https://eplus.jp/jyoukyou/`).
-5. Credentials come from the macOS Keychain inside the server process (default service `eplus-auto-balloter`), so passwords never enter LLM tool arguments. Never ask the user to paste a password into chat; ask them to run `security add-generic-password -U -s eplus-auto-balloter -a <email> -w` themselves.
+2. For non-Sumachike Renban ballots, call `eplus_list_companions()` first to verify registered `同行者` names.
+3. Call `eplus_submit_ballot(entry_url, serial_code, session_name, seat_keyword, goods_keyword, quantity, companions=..., delivery_keyword=..., dry_run=True)` to verify the final confirmation screen via `sim_screenshot()`, then re-call with `dry_run=False`.
+4. If `eplus_submit_ballot()` returns `status == "OTP_REQUIRED"`, fetch the 6-digit code from email (e.g., via Gmail MCP or ask the user), call `eplus_submit_otp(otp_code="123456")`, and re-call `eplus_submit_ballot()`.
+5. Call `eplus_check_history()` on results day to inspect `申込み履歴` (`https://eplus.jp/jyoukyou/`).
+6. Credentials come from the macOS Keychain inside the server process (default service `eplus-auto-balloter`), so passwords never enter LLM tool arguments. Never ask the user to paste a password into chat; ask them to run `security add-generic-password -U -s eplus-auto-balloter -a <email> -w` themselves.
 
 ## Validation Steps
 

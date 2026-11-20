@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 import tomllib
+import unicodedata
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -30,6 +31,89 @@ APPIUM_URL = "http://127.0.0.1:4723"
 
 class EmailOTPRequiredError(RuntimeError):
     """Raised when defer_otp=True and E+ requires a 6-digit メールアドレス認証 code."""
+
+
+def _norm_name(text: str) -> str:
+    """NFKC-normalize (full-width -> ASCII), drop whitespace, lowercase."""
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", text or "")).lower()
+
+
+_MASKED_EMAIL_RE = re.compile(r"^\S*\*+\S*@\S+$")
+_DATE_RE = re.compile(r"^\d{4}/\d{2}/\d{2}")
+
+
+def parse_companion_texts(texts: List[str]) -> List[Dict[str, Any]]:
+    """Parse ordered static texts from member.eplus.jp/update-dokosha into companions.
+
+    Layout per entry: <family>, <given>, <masked email>, 承認日時：, <date>.
+    Entries are returned in page order (1-based `no`), matching the 同行者 dropdown order.
+    """
+    companions: List[Dict[str, Any]] = []
+    for i, txt in enumerate(texts):
+        if not _MASKED_EMAIL_RE.match(txt) or i < 2:
+            continue
+        family, given = texts[i - 2], texts[i - 1]
+        approved = ""
+        for nxt in texts[i + 1 : i + 4]:
+            if _DATE_RE.match(nxt):
+                approved = nxt
+                break
+        companions.append(
+            {
+                "no": len(companions) + 1,
+                "family_name": family,
+                "given_name": given,
+                "display_name": unicodedata.normalize("NFKC", f"{family} {given}"),
+                "masked_email": txt,
+                "approved_at": approved,
+            }
+        )
+    return companions
+
+
+def normalize_companions(value: Any) -> List[Any]:
+    """Turn a config Renban value into a list of companion specs (int index, name str, or dict)."""
+    if value is None or value == 0 or value == -1 or value == "" or value == []:
+        return []
+    if isinstance(value, list):
+        return [v for v in value if v not in (None, 0, -1, "")]
+    return [value]
+
+
+def match_companion_option(option_labels: List[str], companion: Any) -> Optional[str]:
+    """Pick the dropdown option label for a companion spec.
+
+    - int N: the Nth companion option (1-based, same as the "No" on update-dokosha).
+    - str: a name; matches family+given in either order, ignoring spaces and full-width chars.
+    - dict {name, address}: name match, optionally narrowed by address substring.
+    Returns None if there is no unique match.
+    """
+    if isinstance(companion, int):
+        return option_labels[companion - 1] if 1 <= companion <= len(option_labels) else None
+
+    if isinstance(companion, dict):
+        name, address = str(companion.get("name", "")), str(companion.get("address", ""))
+    else:
+        name, address = str(companion), ""
+    if name.strip().isdigit():
+        return match_companion_option(option_labels, int(name.strip()))
+
+    tokens = [t for t in re.split(r"[\s　]+", unicodedata.normalize("NFKC", name).strip()) if t]
+    wanted = {_norm_name("".join(tokens)), _norm_name("".join(reversed(tokens)))}
+
+    def label_name(label: str) -> str:
+        return _norm_name(re.split(r"[（(]", label, maxsplit=1)[0])
+
+    exact = [lbl for lbl in option_labels if label_name(lbl) in wanted]
+    if address:
+        exact = [lbl for lbl in exact if _norm_name(address) in _norm_name(lbl)] or exact
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        return None
+
+    partial = [lbl for lbl in option_labels if any(w and w in label_name(lbl) for w in wanted)]
+    return partial[0] if len(partial) == 1 else None
 
 
 def xpath_literal(value: str) -> str:
@@ -443,7 +527,7 @@ class IOSSafariAutomator:
                     if name and name not in links and len(links) < 40:
                         links.append(name)
                 elif tag == "XCUIElementTypeOther" and (
-                    "選択して下さい" in val or "-----" in val
+                    "選択して下さい" in val or "選択してください" in val or "-----" in val
                 ):
                     if val not in dropdowns and len(dropdowns) < 20:
                         dropdowns.append(val)
@@ -465,34 +549,130 @@ class IOSSafariAutomator:
     ) -> Dict[str, Any]:
         """Open E+ 申込み履歴 (https://eplus.jp/jyoukyou/), sign in if prompted, and summarize."""
         self.open_url("https://eplus.jp/jyoukyou/")
-        src = self.source()
-        if "ログイン" in src:
-            id_tf = self.find("xpath", "//XCUIElementTypeTextField[@name='ID']", timeout=4.0)
-            if not id_tf:
-                login_link = self.find("accessibility id", "ログイン画面へ", timeout=3.0)
-                if login_link:
-                    self.click(login_link)
-                    time.sleep(3.5)
-                    id_tf = self.find("xpath", "//XCUIElementTypeTextField[@name='ID']", timeout=5.0)
-            if id_tf and username and password:
-                self.type_text(id_tf, username)
-                pw_tf = self.find(
-                    "xpath", "//XCUIElementTypeSecureTextField[@name='パスワード']", timeout=10.0
-                )
-                if pw_tf:
-                    self.type_text(pw_tf, password)
-                login_btn = self.find(
-                    "xpath", "//XCUIElementTypeButton[@name='ログイン']", timeout=10.0
-                )
-                if login_btn:
-                    self.click(login_btn)
-                time.sleep(5.0)
-                self.dismiss_save_password_sheet()
-                post_src = self.source()
-                if "メールアドレス認証" in post_src or "追加認証が必要です" in post_src:
-                    self._complete_email_verification()
-                    self.open_url("https://eplus.jp/jyoukyou/")
+        if self.login_if_needed(username, password):
+            self.open_url("https://eplus.jp/jyoukyou/")
         return self.page_summary(max_items=120)
+
+    def dismiss_autofill_sheet(self) -> None:
+        """Close iOS's 'Sign in to eplus.jp with your password?' autofill sheet if it is covering the page."""
+        if "Sign in to" in self.source():
+            close_btn = self.find("xpath", "//XCUIElementTypeButton[@name='xmark']", timeout=2.0)
+            if close_btn:
+                self.click(close_btn)
+                time.sleep(0.8)
+
+    def login_if_needed(self, username: Optional[str], password: Optional[str]) -> bool:
+        """Sign in on member.eplus.jp if the current page shows a login form. Returns True if it logged in."""
+        self.dismiss_autofill_sheet()
+        id_tf = self.find("xpath", "//XCUIElementTypeTextField[@name='ID']", timeout=4.0)
+        if not id_tf:
+            login_link = self.find("accessibility id", "ログイン画面へ", timeout=2.0)
+            if not login_link:
+                return False
+            self.click(login_link)
+            time.sleep(3.5)
+            self.dismiss_autofill_sheet()
+            id_tf = self.find("xpath", "//XCUIElementTypeTextField[@name='ID']", timeout=5.0)
+        if not (id_tf and username and password):
+            return False
+
+        self.type_text(id_tf, username)
+        pw_tf = self.find("xpath", "//XCUIElementTypeSecureTextField[@name='パスワード']", timeout=10.0)
+        if pw_tf:
+            self.type_text(pw_tf, password)
+        self.dismiss_keyboard()
+        login_btn = self.find("xpath", "//XCUIElementTypeButton[@name='ログイン']", timeout=10.0)
+        if login_btn:
+            self.click(login_btn)
+        time.sleep(5.0)
+        self.dismiss_save_password_sheet()
+        post_src = self.source()
+        if "メールアドレス認証" in post_src or "追加認証が必要です" in post_src:
+            self._complete_email_verification()
+        return True
+
+    def list_companions(
+        self,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Read registered companions (同行者) from https://member.eplus.jp/update-dokosha."""
+        url = "https://member.eplus.jp/update-dokosha"
+        self.open_url(url)
+        if self.login_if_needed(username, password):
+            self.open_url(url)
+        summary = self.page_summary(max_items=200)
+        return {"companions": parse_companion_texts(self.ordered_texts()), "page": summary}
+
+    def ordered_texts(self) -> List[str]:
+        """All visible static texts in document order (no de-duplication)."""
+        out: List[str] = []
+        try:
+            for el in ET.fromstring(self.source()).iter("XCUIElementTypeStaticText"):
+                txt = (el.attrib.get("value") or el.attrib.get("name") or "").strip()
+                if txt:
+                    out.append(txt)
+        except Exception as exc:
+            logging.warning(f"<Appium> Failed to parse source XML: {exc}")
+        return out
+
+    _COMPANION_DD_XPATH = (
+        "//XCUIElementTypeOther[(contains(@value, '同行者') or contains(@value, '来場者'))"
+        " and contains(@value, '選択')]"
+    )
+
+    def _companion_dropdowns(self) -> List[str]:
+        return self.find_all("xpath", self._COMPANION_DD_XPATH)
+
+    def _select_companion(self, dropdown_index: int, companion: Any) -> Tuple[bool, str]:
+        """Open the Nth 同行者 dropdown and choose the matching registered companion."""
+        page_buttons = {self.attr(b, "name") for b in self.find_all("class name", "XCUIElementTypeButton")}
+        for _ in range(3):
+            dds = self._companion_dropdowns()
+            if len(dds) <= dropdown_index:
+                return False, f"同行者 dropdown #{dropdown_index + 1} not found"
+            self.click(dds[dropdown_index])
+            time.sleep(1.0)
+            option_ids: Dict[str, str] = {}
+            for b in self.find_all("class name", "XCUIElementTypeButton"):
+                label = self.attr(b, "name")
+                if label and label not in page_buttons and "選択してください" not in label:
+                    option_ids.setdefault(label, b)
+            labels = list(option_ids)
+            if not labels:
+                time.sleep(0.8)
+                continue
+            chosen = match_companion_option(labels, companion)
+            if not chosen:
+                self.dismiss_keyboard()
+                return False, f"No unique registered companion matching {companion!r} (options: {len(labels)})"
+            self.click(option_ids[chosen])
+            time.sleep(1.2)
+            logging.info(f"<Renban> 同行者{dropdown_index + 1} -> {chosen}")
+            return True, chosen
+        return False, f"同行者 dropdown #{dropdown_index + 1} opened but showed no options"
+
+    def handle_companions(self, companions: List[Any]) -> Tuple[bool, str]:
+        """Fill 同行者 dropdowns on the current page, or fail safely before submission."""
+        dds = self._companion_dropdowns()
+        if not companions:
+            if dds:
+                return False, "COMPANION_REQUIRED: this ballot asks for 同行者 but no Renban was configured"
+            return True, "NO_COMPANION"
+        if not dds:
+            return False, (
+                "COMPANION_SELECTOR_NOT_FOUND: Renban configured but this page has no 同行者 selector "
+                "(Sumachike ballots distribute tickets after winning; set Renban = 0)"
+            )
+        if len(companions) > len(dds):
+            return False, f"Configured {len(companions)} companions but page has {len(dds)} 同行者 slot(s)"
+        chosen: List[str] = []
+        for i, comp in enumerate(companions):
+            ok, info = self._select_companion(i, comp)
+            if not ok:
+                return False, info
+            chosen.append(info)
+        return True, " / ".join(chosen)
 
     def _find_stop_next_button(self, session_name: str) -> Optional[str]:
         """Match the 次へ button belonging to session_name dynamically using XML y-coordinates."""
@@ -623,12 +803,20 @@ class IOSSafariAutomator:
         password: Optional[str] = None,
         screenshot_prefix: Optional[str] = None,
         dry_run: bool = False,
+        companions: Optional[List[Any]] = None,
+        delivery_keyword: str = "スマチケ",
     ) -> Tuple[bool, str]:
         print(
-            f"\n=== Starting application: Code={code}, Stop={session_name}, Qty={quantity}, DryRun={dry_run} ===",
+            f"\n=== Starting application: Code={code}, Stop={session_name}, Qty={quantity}, "
+            f"Companions={len(companions or [])}, DryRun={dry_run} ===",
             file=sys.stderr,
             flush=True,
         )
+        if companions and len(companions) != quantity - 1:
+            return False, (
+                f"CONFIG_ERROR: {len(companions)} companion(s) configured for Quantity={quantity}; "
+                "a renban application needs exactly Quantity - 1 companions"
+            )
         ok, status = self._open_and_enter_serial_and_stop(entry_url, code, session_name)
         if not ok:
             return False, status
@@ -697,13 +885,17 @@ class IOSSafariAutomator:
         self.click(apply_link)
         time.sleep(4.0)
 
-        # 7. Payment & Delivery: select スマチケ + コンビニ／ＡＴＭ -> 次へ
-        suma = self.find(
-            "xpath", "//XCUIElementTypeStaticText[contains(@name, 'スマチケ')]", timeout=10.0
-        )
-        if suma:
-            self.click(suma)
-            time.sleep(0.5)
+        # 7. Payment & Delivery: select delivery option (default スマチケ) + コンビニ／ＡＴＭ -> 次へ
+        if delivery_keyword and delivery_keyword.lower() != "default":
+            delivery_target = "スマチケ" if delivery_keyword.lower() == "sumachike" else delivery_keyword
+            delivery_el = self.find(
+                "xpath",
+                f"//XCUIElementTypeStaticText[contains(@name, {xpath_literal(delivery_target)})]",
+                timeout=10.0,
+            )
+            if delivery_el:
+                self.click(delivery_el)
+                time.sleep(0.5)
 
         conbini = self.find(
             "xpath", "//XCUIElementTypeStaticText[@name='コンビニ／ＡＴＭ']", timeout=10.0
@@ -718,6 +910,19 @@ class IOSSafariAutomator:
             return False, "Could not find 次へ link on payment screen"
         self.click(pay_next)
         time.sleep(4.0)
+
+        # 7b. Renban: fill 同行者 dropdown(s) (non-Sumachike ballots) or fail before submitting
+        ok, renban_info = self.handle_companions(companions or [])
+        if not ok:
+            return False, renban_info
+        if companions:
+            print(f"  同行者: {renban_info}", file=sys.stderr, flush=True)
+            # Some receptions put 同行者 on its own page with a 次へ before the final confirmation
+            if not self.find("xpath", "//XCUIElementTypeLink[@name='同意して申込み']", timeout=2.0):
+                renban_next = self.find("xpath", "//XCUIElementTypeLink[@name='次へ']", timeout=5.0)
+                if renban_next:
+                    self.click(renban_next)
+                    time.sleep(4.0)
 
         # 8. Final confirmation: check all unchecked switches -> 同意して申込み
         switches = self.find_all("class name", "XCUIElementTypeSwitch")
@@ -773,7 +978,7 @@ def main() -> None:
         "--pairs",
         nargs="*",
         default=None,
-        help="Optional explicit code:session pairs (e.g. abc12345:福岡公演)",
+        help="Optional explicit CODE:SESSION[:COMPANION] jobs (e.g. abc12345:福岡公演 or abc12345:昼公演:'Taro Tanaka')",
     )
     parser.add_argument(
         "--account-index",
@@ -802,6 +1007,21 @@ def main() -> None:
         default=None,
         help="Optional path prefix to save completion screenshots",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Fill everything (incl. 同行者) but stop before clicking 同意して申込み",
+    )
+    parser.add_argument(
+        "--list-companions",
+        action="store_true",
+        help="Print registered 同行者 (from member.eplus.jp/update-dokosha) for the account and exit",
+    )
+    parser.add_argument(
+        "--allow-duplicate-companion",
+        action="store_true",
+        help="Allow the same companion in more than one application for the same show in one run",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -818,7 +1038,7 @@ def main() -> None:
     entry_url = config["URL"]
 
     ballots = config["Ballots"]
-    if args.pairs:
+    if args.pairs or args.list_companions:
         if not (0 <= args.account_index < len(ballots)):
             raise ValueError(
                 f"--account-index {args.account_index} out of range for {len(ballots)} [[Ballots]] entries"
@@ -829,6 +1049,7 @@ def main() -> None:
 
     results: List[Tuple[str, str, bool, str]] = []
     previous_username: Optional[str] = None
+    companion_usage: set = set()
 
     with IOSSafariAutomator(
         udid=udid,
@@ -837,6 +1058,12 @@ def main() -> None:
         otp_cmd=args.otp_cmd,
         otp_timeout=args.otp_timeout,
     ) as auto:
+        if args.list_companions:
+            username, password = resolve_credentials(ballots[0]["Credentials"])
+            for c in auto.list_companions(username, password)["companions"]:
+                print(f"  No.{c['no']:>2}  {c['display_name']:<24} {c['masked_email']:<28} {c['approved_at']}")
+            return
+
         for ballot in ballots:
             creds = ballot["Credentials"]
             username, password = resolve_credentials(creds)
@@ -855,22 +1082,36 @@ def main() -> None:
             seat_keyword = ballot.get("SeatKeyword") or ballot.get("SeatType") or "一般指定席"
             goods_keyword = ballot.get("GoodsKeyword", "特製グッズ無し")
 
-            jobs: List[Tuple[str, str]] = []
+            jobs: List[Tuple[str, str, List[Any]]] = []
+            default_companions = normalize_companions(ballot.get("Renban"))
             if args.pairs:
                 for item in args.pairs:
-                    if ":" not in item:
-                        raise ValueError(f"Invalid --pairs entry (expected CODE:SESSION): {item!r}")
-                    c, s = item.split(":", 1)
-                    jobs.append((c, s))
+                    parts = item.split(":", 2)
+                    if len(parts) < 2:
+                        raise ValueError(
+                            f"Invalid --pairs entry (expected CODE:SESSION[:COMPANION]): {item!r}"
+                        )
+                    comps = normalize_companions(parts[2]) if len(parts) == 3 else default_companions
+                    jobs.append((parts[0], parts[1], comps))
             else:
                 sessions = ballot["Sessions"]
                 if isinstance(sessions, str):
                     sessions = [sessions]
                 for c in ballot["Codes"]:
                     for s in sessions:
-                        jobs.append((c, s))
+                        jobs.append((c, s, default_companions))
 
-            for code, stop in jobs:
+            for code, stop, comps in jobs:
+                # Guard: the same companion in two applications for the same show risks duplicate-win voiding
+                dup = [c for c in comps if (stop, _norm_name(str(c))) in companion_usage]
+                if dup and not args.allow_duplicate_companion:
+                    info = (
+                        f"DUPLICATE_COMPANION: {dup} already used for {stop} in this run "
+                        "(pass --allow-duplicate-companion to override)"
+                    )
+                    results.append((code, stop, False, info))
+                    continue
+
                 ok, info = auto.apply_single(
                     entry_url=entry_url,
                     code=code,
@@ -881,7 +1122,12 @@ def main() -> None:
                     username=username,
                     password=password,
                     screenshot_prefix=args.screenshot_prefix,
+                    dry_run=args.dry_run,
+                    companions=comps,
+                    delivery_keyword=config.get("DeliveryMethod", "スマチケ"),
                 )
+                if ok:
+                    companion_usage.update((stop, _norm_name(str(c))) for c in comps)
                 results.append((code, stop, ok, info))
                 logging.info(f"<iOS Ballot> Code={code} Stop={stop} OK={ok} Info={info}")
 

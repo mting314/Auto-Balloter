@@ -33,8 +33,10 @@ from ios_balloter import (
     APPIUM_URL,
     EmailOTPRequiredError,
     IOSSafariAutomator,
+    _norm_name,
     detect_booted_iphone_udid,
     ensure_appium_running,
+    normalize_companions,
 )
 
 from credentials import resolve_credentials
@@ -89,6 +91,7 @@ class BalloterSessionManager:
         self.appium_url = appium_url.rstrip("/")
         self._lock = threading.Lock()
         self._automator: Optional[IOSSafariAutomator] = None
+        self.companion_usage: set = set()
         atexit.register(self.close)
 
     def get_automator(self, udid: Optional[str] = None) -> IOSSafariAutomator:
@@ -129,11 +132,13 @@ SESSION = BalloterSessionManager(
 mcp = MCPServer(
     name="eplus-auto-balloter",
     instructions=(
-        "Automates Japanese E+ (eplus.jp) smartphone-only Sumachike (スマチケ) lottery "
-        "applications using genuine Mobile Safari in a booted Xcode iOS Simulator via "
-        "Appium XCUITest. Always check sim_status() first. If eplus_submit_ballot() "
-        "returns status='OTP_REQUIRED', fetch the 6-digit email code (e.g. via Gmail MCP "
-        "or the user), call eplus_submit_otp(otp_code), and then re-call eplus_submit_ballot()."
+        "Automates Japanese E+ (eplus.jp) smartphone Sumachike (スマチケ) and Renban (連番 / 同行者) "
+        "lottery applications using genuine Mobile Safari in a booted Xcode iOS Simulator via "
+        "Appium XCUITest. Always check sim_status() first. For non-Sumachike Renban ballots, "
+        "call eplus_list_companions() to verify registered 同行者 names before passing companions "
+        "to eplus_submit_ballot(). If eplus_submit_ballot() returns status='OTP_REQUIRED', fetch "
+        "the 6-digit email code (e.g. via Gmail MCP or the user), call eplus_submit_otp(otp_code), "
+        "and then re-call eplus_submit_ballot()."
     ),
 )
 
@@ -269,16 +274,23 @@ def eplus_submit_ballot(
     seat_keyword: str = "一般指定席",
     goods_keyword: str = "特製グッズ無し",
     quantity: int = 2,
+    companions: Optional[List[Any]] = None,
+    delivery_keyword: str = "スマチケ",
+    allow_duplicate_companion: bool = False,
     dry_run: bool = False,
     save_screenshot: bool = True,
     config_path: str = "config.toml",
     account_index: int = 0,
 ) -> Dict[str, Any]:
-    """Submit a single E+ Sumachike serial-code ballot via iOS Simulator Mobile Safari.
+    """Submit a single E+ serial-code ballot via iOS Simulator Mobile Safari.
 
-    Set dry_run=True to stop right before clicking 同意して申込み and inspect the summary.
-    If E+ prompts for first-time email OTP (メールアドレス認証), returns status='OTP_REQUIRED'
-    without blocking so the agent can fetch the 6-digit code and call eplus_submit_otp().
+    - For Sumachike (スマチケ) ballots, leave companions=None (tickets are distributed in-app after winning).
+    - For non-Sumachike Renban (連番) ballots, pass companions=['Full Name'] or [1] (1-based No. from
+      eplus_list_companions()); must have exactly quantity - 1 entries.
+    - Set delivery_keyword='スマチケ' (default) or e.g. 'セブン-イレブン' / 'ファミリーマート' / 'default'.
+    - Set dry_run=True to stop right before clicking 同意して申込み and inspect the confirmation screen.
+    - If E+ prompts for first-time email OTP (メールアドレス認証), returns status='OTP_REQUIRED'
+      without blocking so the agent can fetch the 6-digit code and call eplus_submit_otp().
     """
     try:
         validated_url = _validate_eplus_url(entry_url)
@@ -286,6 +298,28 @@ def eplus_submit_ballot(
         return {"status": "FAILED", "detail": str(exc)}
     if quantity not in (1, 2, 3, 4):
         return {"status": "FAILED", "detail": f"Invalid ticket quantity: {quantity}"}
+
+    norm_companions = normalize_companions(companions)
+    if norm_companions and len(norm_companions) != quantity - 1:
+        return {
+            "status": "CONFIG_ERROR",
+            "detail": (
+                f"{len(norm_companions)} companion(s) provided for quantity={quantity}; "
+                "a renban ballot requires exactly quantity - 1 companions."
+            ),
+        }
+
+    dups = [
+        c for c in norm_companions if (session_name, _norm_name(str(c))) in SESSION.companion_usage
+    ]
+    if dups and not allow_duplicate_companion:
+        return {
+            "status": "DUPLICATE_COMPANION",
+            "detail": (
+                f"Companion(s) {dups} already used for '{session_name}' in this session "
+                "(duplicate wins risk voiding; pass allow_duplicate_companion=True to override)."
+            ),
+        }
 
     username, password = _resolve_credentials(config_path=config_path, account_index=account_index)
     auto = SESSION.get_automator()
@@ -311,6 +345,8 @@ def eplus_submit_ballot(
             password=password,
             screenshot_prefix=screenshot_prefix,
             dry_run=dry_run,
+            companions=norm_companions,
+            delivery_keyword=delivery_keyword,
         )
     except EmailOTPRequiredError as exc:
         return {
@@ -331,16 +367,21 @@ def eplus_submit_ballot(
             "serial_code": serial_code,
             "session_name": session_name,
             "quantity": quantity,
+            "companions": norm_companions,
             "screenshot_path": expected_screenshot if expected_screenshot and Path(expected_screenshot).exists() else None,
             "detail": "Stopped before clicking 同意して申込み. Inspect sim_screenshot() and re-run with dry_run=False to submit.",
         }
 
     if ok:
+        SESSION.companion_usage.update(
+            (session_name, _norm_name(str(c))) for c in norm_companions
+        )
         return {
             "status": "COMPLETED",
             "serial_code": serial_code,
             "session_name": session_name,
             "quantity": quantity,
+            "companions": norm_companions,
             "receipt": info,
             "screenshot_path": expected_screenshot if expected_screenshot and Path(expected_screenshot).exists() else None,
         }
@@ -353,12 +394,52 @@ def eplus_submit_ballot(
             "detail": f"E+ rejected serial code with {info}",
         }
 
+    for prefix in ("COMPANION_REQUIRED", "COMPANION_SELECTOR_NOT_FOUND", "CONFIG_ERROR"):
+        if isinstance(info, str) and info.startswith(prefix):
+            return {
+                "status": prefix,
+                "serial_code": serial_code,
+                "session_name": session_name,
+                "detail": info,
+            }
+
     return {
         "status": "FAILED",
         "serial_code": serial_code,
         "session_name": session_name,
         "detail": info,
         "screenshot_path": expected_screenshot if expected_screenshot and Path(expected_screenshot).exists() else None,
+    }
+
+
+@mcp.tool()
+def eplus_list_companions(
+    config_path: str = "config.toml",
+    account_index: int = 0,
+) -> Dict[str, Any]:
+    """Read registered 同行者 (companions) from https://member.eplus.jp/update-dokosha.
+
+    Returns 1-based `no`, normalized `display_name`, `masked_email`, and `approved_at` so
+    an agent can verify registered companions before filing a non-Sumachike Renban ballot.
+    """
+    username, password = _resolve_credentials(config_path=config_path, account_index=account_index)
+    auto = SESSION.get_automator()
+    try:
+        res = auto.list_companions(username=username, password=password)
+    except EmailOTPRequiredError as exc:
+        return {
+            "status": "OTP_REQUIRED",
+            "detail": str(exc),
+            "next_step": "Call eplus_submit_otp(otp_code='123456') and then re-call eplus_list_companions().",
+        }
+    except Exception as exc:
+        return {"status": "FAILED", "detail": str(exc)}
+
+    companions = res["companions"]
+    return {
+        "status": "OK",
+        "count": len(companions),
+        "companions": companions,
     }
 
 
