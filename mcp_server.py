@@ -22,6 +22,7 @@ import subprocess
 import threading
 import time
 import tomllib
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -29,6 +30,7 @@ from urllib.parse import urlparse
 import requests
 from mcp.server.mcpserver import Image, MCPServer
 
+from credentials import resolve_credentials
 from ios_balloter import (
     APPIUM_URL,
     EmailOTPRequiredError,
@@ -38,8 +40,21 @@ from ios_balloter import (
     ensure_appium_running,
     normalize_companions,
 )
-
-from credentials import resolve_credentials
+from planner import (
+    AccountProfile,
+    BallotJob,
+    BallotPlan,
+    EventRules,
+    allocate_serials,
+    execute_job,
+    format_plan_markdown,
+    jobs_from_sheet_rows,
+    jobs_to_sheet_rows,
+    load_plan,
+    order_jobs_by_account,
+    save_plan,
+    validate_plan,
+)
 
 DEFAULT_KEYCHAIN_SERVICE = "eplus-auto-balloter"
 CACHE_DIR = Path.home() / ".cache" / "auto-balloter"
@@ -92,6 +107,7 @@ class BalloterSessionManager:
         self._lock = threading.Lock()
         self._automator: Optional[IOSSafariAutomator] = None
         self.companion_usage: set = set()
+        self.active_account_id: Optional[str] = None
         atexit.register(self.close)
 
     def get_automator(self, udid: Optional[str] = None) -> IOSSafariAutomator:
@@ -495,7 +511,219 @@ def eplus_logout() -> Dict[str, Any]:
     """Log out of member.eplus.jp in Mobile Safari (use before switching E+ accounts)."""
     auto = SESSION.get_automator()
     auto.logout()
+    SESSION.active_account_id = None
     return {"status": "LOGGED_OUT"}
+
+
+@mcp.tool()
+def plan_from_sheet_rows(
+    rows: List[List[Any]],
+    entry_url: str,
+    is_sumachike: bool = True,
+    max_stops_per_serial: int = 2,
+    max_qty_per_ballot: int = 2,
+    default_account_id: str = "primary",
+    default_seat: str = "一般指定席",
+    default_goods: str = "特製グッズ無し",
+    save_to_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Parse 2D Google Sheets rows (header + data) into a validated ballot plan.
+
+    Accepts raw 2D arrays from Google Sheets MCP, auto-detects English/Japanese headers
+    (Serial/シリアル, Account/アカウント, Stop/公演, Qty/枚数, Companion/同行者, Status, etc.),
+    validates all constraints, and optionally saves the plan to a local TOML/CSV file.
+    """
+    try:
+        validated_url = _validate_eplus_url(entry_url)
+    except ValueError as exc:
+        return {"valid": False, "errors": [str(exc)]}
+
+    jobs = jobs_from_sheet_rows(
+        rows=rows,
+        default_account_id=default_account_id,
+        default_seat=default_seat,
+        default_goods=default_goods,
+        is_sumachike=is_sumachike,
+    )
+    accounts = {
+        j.account_id: AccountProfile(id=j.account_id, display_name=j.account_id)
+        for j in jobs
+    }
+    plan = BallotPlan(
+        rules=EventRules(
+            entry_url=validated_url,
+            is_sumachike=is_sumachike,
+            max_stops_per_serial=max_stops_per_serial,
+            max_qty_per_ballot=max_qty_per_ballot,
+            delivery_keyword="スマチケ" if is_sumachike else "default",
+        ),
+        accounts=accounts,
+        jobs=order_jobs_by_account(jobs),
+    )
+    val = validate_plan(plan)
+    saved_path = None
+    if save_to_path:
+        dest = Path(save_to_path).expanduser()
+        _ensure_private_dir(dest.parent)
+        save_plan(dest, plan)
+        saved_path = str(dest)
+
+    pending = [asdict(j) for j in plan.jobs if j.is_pending()]
+    return {
+        "valid": val.valid,
+        "errors": val.errors,
+        "warnings": val.warnings,
+        "pending_count": val.pending_count,
+        "completed_count": val.completed_count,
+        "accounts_order": val.accounts_order,
+        "pending_jobs": pending,
+        "saved_path": saved_path,
+        "markdown_preview": format_plan_markdown(plan, val),
+    }
+
+
+@mcp.tool()
+def plan_allocate(
+    serials: List[Dict[str, Any]],
+    accounts: List[Dict[str, Any]],
+    target_stops: List[str],
+    entry_url: str,
+    is_sumachike: bool = True,
+    max_stops_per_serial: int = 2,
+    max_qty_per_ballot: int = 2,
+    default_quantity: int = 2,
+    allow_cross_renban: bool = False,
+    save_to_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Allocate a pool of serial codes across accounts and tour stops, then validate.
+
+    - serials: list of {"code": "...", "owner": "alice", "stops": [...], "quantity": 2,
+      "companions": [...], "intended_companions": [...], "account_id": "..."}
+    - accounts: list of {"id": "alice", "username": "alice@example.com", "display_name": "Alice"}
+    Returns a validated plan, Google-Sheets-ready 2D `sheet_rows`, and a Markdown approval table.
+    """
+    try:
+        validated_url = _validate_eplus_url(entry_url)
+    except ValueError as exc:
+        return {"valid": False, "errors": [str(exc)]}
+
+    acc_objs = [
+        AccountProfile(
+            id=str(a["id"]),
+            username=str(a.get("username", "")),
+            keychain=str(a.get("keychain", DEFAULT_KEYCHAIN_SERVICE)),
+            display_name=str(a.get("display_name", a["id"])),
+        )
+        for a in accounts
+    ]
+    rules = EventRules(
+        entry_url=validated_url,
+        is_sumachike=is_sumachike,
+        max_stops_per_serial=max_stops_per_serial,
+        max_qty_per_ballot=max_qty_per_ballot,
+        allow_cross_renban=allow_cross_renban,
+        delivery_keyword="スマチケ" if is_sumachike else "default",
+    )
+    plan = allocate_serials(
+        serials=serials,
+        accounts=acc_objs,
+        target_stops=target_stops,
+        rules=rules,
+        default_quantity=default_quantity,
+    )
+    val = validate_plan(plan)
+    saved_path = None
+    if save_to_path:
+        dest = Path(save_to_path).expanduser()
+        _ensure_private_dir(dest.parent)
+        save_plan(dest, plan)
+        saved_path = str(dest)
+
+    return {
+        "valid": val.valid,
+        "errors": val.errors,
+        "warnings": val.warnings,
+        "pending_count": val.pending_count,
+        "accounts_order": val.accounts_order,
+        "jobs": [asdict(j) for j in plan.jobs],
+        "sheet_rows": jobs_to_sheet_rows(plan.jobs),
+        "saved_path": saved_path,
+        "markdown_preview": format_plan_markdown(plan, val),
+    }
+
+
+@mcp.tool()
+def plan_validate(
+    plan_path: str,
+    entry_url: str = "",
+    is_sumachike: bool = True,
+    check_keychain: bool = False,
+) -> Dict[str, Any]:
+    """Validate an existing TOML or CSV ballot plan file and return a Markdown preview."""
+    plan = load_plan(Path(plan_path).expanduser(), entry_url=entry_url, is_sumachike=is_sumachike)
+    val = validate_plan(plan, check_keychain=check_keychain)
+    return {
+        "valid": val.valid,
+        "errors": val.errors,
+        "warnings": val.warnings,
+        "pending_count": val.pending_count,
+        "completed_count": val.completed_count,
+        "accounts_order": val.accounts_order,
+        "markdown_preview": format_plan_markdown(plan, val),
+    }
+
+
+@mcp.tool()
+def plan_execute_next(
+    plan_path: str,
+    dry_run: bool = False,
+    entry_url: str = "",
+    is_sumachike: bool = True,
+) -> Dict[str, Any]:
+    """Execute the next pending job in a TOML/CSV plan (sequentially grouped by account).
+
+    Automatically logs out when switching between accounts, resolves each account's password
+    from macOS Keychain, persists status/receipt/screenshot back to `plan_path`, logs to
+    ~/.cache/auto-balloter/filings.jsonl, and returns `sheet_row` + `row_values` for live
+    Google Sheets write-back. Returns status='OTP_REQUIRED' (with account_email) if the next
+    account needs email verification.
+    """
+    resolved_path = Path(plan_path).expanduser()
+    plan = load_plan(resolved_path, entry_url=entry_url, is_sumachike=is_sumachike)
+    val = validate_plan(plan)
+    if not val.valid:
+        return {
+            "status": "INVALID_PLAN",
+            "errors": val.errors,
+            "warnings": val.warnings,
+        }
+
+    pending = [j for j in order_jobs_by_account(plan.jobs) if j.is_pending()]
+    if not pending:
+        return {"status": "ALL_DONE", "remaining_pending": 0}
+
+    job = pending[0]
+    auto = SESSION.get_automator()
+    status, detail = execute_job(
+        auto=auto,
+        plan=plan,
+        job=job,
+        previous_account_id=SESSION.active_account_id,
+        dry_run=dry_run,
+        screenshot_dir=SCREENSHOT_DIR,
+    )
+    if status != "OTP_REQUIRED":
+        SESSION.active_account_id = job.account_id
+        save_plan(resolved_path, plan)
+    else:
+        SESSION.active_account_id = job.account_id
+
+    remaining = sum(1 for j in plan.jobs if j.is_pending())
+    return {
+        "status": status,
+        "remaining_pending": remaining,
+        **detail,
+    }
 
 
 @mcp.tool()

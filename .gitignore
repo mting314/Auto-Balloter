@@ -162,6 +162,9 @@ cython_debug/
 #.idea/
 
 config.toml
+plans/
+*.plan.toml
+*.plan.csv
 
 *.swp
 

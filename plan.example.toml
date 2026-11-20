@@ -1,0 +1,63 @@
+# Example multi-account ballot job list for `planner.py` and `mcp_server.py`.
+# Copy to ~/.cache/auto-balloter/plans/<event>.toml (or any *.plan.toml, gitignored)
+# and never commit real serial codes or personal emails.
+
+[Event]
+URL = "https://eplus.jp/serial/example_tour/"
+IsSumachike = true            # true = スマチケ (post-win 分配); false = non-Sumachike Renban (同行者 at filing)
+MaxStopsPerSerial = 2         # e.g. one serial can apply to up to 2 distinct stops
+MaxQtyPerBallot = 2
+AllowDuplicatePersonPerStop = false
+AllowCrossRenban = false      # set true only if event permits 相互連番 (A+B and B+A on same stop)
+DeliveryKeyword = "スマチケ"  # or "セブン-イレブン" / "ファミリーマート" / "default"
+
+# Each account maps to its own macOS Keychain entry:
+#   security add-generic-password -U -s eplus-auto-balloter -a alice@example.com -w
+[Accounts.alice]
+username = "alice@example.com"
+keychain = "eplus-auto-balloter"
+display_name = "Alice"
+
+[Accounts.bob]
+username = "bob@example.com"
+keychain = "eplus-auto-balloter"
+display_name = "Bob"
+
+[[Jobs]]
+id = "job_1"
+account = "alice"
+serial = "aaaa1111"
+stop = "福岡公演"
+quantity = 2
+seat = "一般指定席"
+goods = "特製グッズ無し"
+companions = []               # empty for Sumachike; set ["Bob"] for non-Sumachike Renban
+intended_companions = ["Bob"] # post-win Sumachike 分配 tracker
+status = "Not filed"
+notes = "Alice's serial #1"
+
+[[Jobs]]
+id = "job_2"
+account = "alice"
+serial = "aaaa1111"
+stop = "愛知公演"
+quantity = 2
+seat = "一般指定席"
+goods = "特製グッズ無し"
+companions = []
+intended_companions = ["Bob"]
+status = "Not filed"
+notes = "Alice's serial #1 (2nd stop)"
+
+[[Jobs]]
+id = "job_3"
+account = "bob"
+serial = "bbbb2222"
+stop = "東京公演"
+quantity = 1
+seat = "一般指定席"
+goods = "特製グッズ無し"
+companions = []
+intended_companions = []
+status = "Not filed"
+notes = "Bob solo"

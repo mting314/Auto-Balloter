@@ -89,7 +89,23 @@ To expose the iOS Simulator Sumachike automator as composable tools for AI agent
 }
 ```
 
-Credentials are read inside the server process from the macOS Keychain (service `eplus-auto-balloter` by default, or each `[[Ballots]]` entry's `keychain` key), never passed as LLM tool arguments. Tools include `sim_status`, `sim_boot`, `sim_screenshot`, `sim_page_summary`, `eplus_open_url`, `eplus_list_companions`, `eplus_submit_ballot` (with Renban `companions`, `delivery_keyword`, `dry_run=True`, duplicate-companion protection, and non-blocking `OTP_REQUIRED` responses), `eplus_submit_otp`, `eplus_check_history`, `eplus_logout`, and `balloter_close_session`.
+Credentials are read inside the server process from the macOS Keychain (service `eplus-auto-balloter` by default, or each `[[Ballots]]` entry's `keychain` key), never passed as LLM tool arguments. Tools include `sim_status`, `sim_boot`, `sim_screenshot`, `sim_page_summary`, `eplus_open_url`, `eplus_list_companions`, `eplus_submit_ballot` (with Renban `companions`, `delivery_keyword`, `dry_run=True`, duplicate-companion protection, and non-blocking `OTP_REQUIRED` responses), `eplus_submit_otp`, `eplus_check_history`, `eplus_logout`, `balloter_close_session`, plus job-list/Google Sheets planner tools (`plan_from_sheet_rows`, `plan_allocate`, `plan_validate`, `plan_execute_next`).
+
+### Multi-Account Job List & Serial-Allocation Planner (`planner.py`)
+For multi-account group buys or tracking ballots in Google Sheets, use [`planner.py`](./planner.py) (see [`plan.example.toml`](./plan.example.toml) for the schema; keep real plans under gitignored `plans/` or `~/.cache/auto-balloter/plans/`):
+
+```bash
+# Validate a TOML or CSV ballot plan and print an approval table:
+uv run planner.py validate plan.example.toml
+
+# Run pending jobs sequentially grouped by account (logs out between accounts, updates status/receipts in place):
+uv run planner.py run ~/.cache/auto-balloter/plans/tour.toml --dry-run
+
+# Export a plan (with live status/receipts) to Google-Sheets-ready CSV:
+uv run planner.py export-csv ~/.cache/auto-balloter/plans/tour.toml tour_status.csv
+```
+
+All filings also write structured JSONL audit records to `~/.cache/auto-balloter/filings.jsonl`. When paired with a Google Sheets MCP plugin, agents can pass 2D sheet rows directly into `plan_from_sheet_rows()` and write back `row_values` returned by `plan_execute_next()`.
 
 ### Agent Skill
 This repository also includes a workspace Agent Skill at [`.agents/skills/eplus-sumachike-balloter/SKILL.md`](./.agents/skills/eplus-sumachike-balloter/SKILL.md) so AI coding agents (Antigravity, Claude Code, Codex, etc.) can automatically discover and run the iOS Simulator Sumachike workflow, including first-time email OTP verification via `--otp-file` or the MCP server.

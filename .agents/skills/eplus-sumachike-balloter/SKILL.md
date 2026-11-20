@@ -97,7 +97,8 @@ When running inside an MCP-enabled agent alongside Gmail / Google Sheets / Disco
 3. Call `eplus_submit_ballot(entry_url, serial_code, session_name, seat_keyword, goods_keyword, quantity, companions=..., delivery_keyword=..., dry_run=True)` to verify the final confirmation screen via `sim_screenshot()`, then re-call with `dry_run=False`.
 4. If `eplus_submit_ballot()` returns `status == "OTP_REQUIRED"`, fetch the 6-digit code from email (e.g., via Gmail MCP or ask the user), call `eplus_submit_otp(otp_code="123456")`, and re-call `eplus_submit_ballot()`.
 5. Call `eplus_check_history()` on results day to inspect `申込み履歴` (`https://eplus.jp/jyoukyou/`).
-6. Credentials come from the macOS Keychain inside the server process (default service `eplus-auto-balloter`), so passwords never enter LLM tool arguments. Never ask the user to paste a password into chat; ask them to run `security add-generic-password -U -s eplus-auto-balloter -a <email> -w` themselves.
+6. For multi-account or Google Sheets workflows, use `plan_from_sheet_rows()` / `plan_allocate()` / `plan_validate()` to show the user a validated Markdown plan table for approval before calling `plan_execute_next(plan_path, dry_run=...)`. Each completed job returns `sheet_row` and `row_values` for immediate write-back to Google Sheets, and logs to `~/.cache/auto-balloter/filings.jsonl`.
+7. Credentials come from the macOS Keychain inside the server process (default service `eplus-auto-balloter`), so passwords never enter LLM tool arguments. Never ask the user to paste a password into chat; ask them to run `security add-generic-password -U -s eplus-auto-balloter -a <email> -w` themselves.
 
 ## Validation Steps
 
